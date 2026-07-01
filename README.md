@@ -1,6 +1,6 @@
 # Bio-MLFF
 
-Bio-MLFF contains JAX model implementations that run through [Openmm-JAX's JaxForce](https://github.com/mitkotak/openmm-jax)
+Bio-MLFF contains machine learning force fields in JAX that run through [Openmm-JAX's JaxForce](https://github.com/mitkotak/openmm-jax)
 
 ```bash
 pip install bio-mlff
