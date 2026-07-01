@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bio-mlff"
+version = "0.1.0"
+description = "Bio/chemistry machine-learning force fields for OpenMM-JAX"
+requires-python = ">=3.11"
+dependencies = [
+    "openmm>=8.5.2",
+    "openmmjax>=0.1",
+    "openmmml>=1.7",
+    "equinox>=0.13.8",
+    "jax",
+    "jax-md>=0.2.29",
+    "jaxlib",
+    "numpy",
+]
+
+[project.optional-dependencies]
+fennix = [
+    "fennol>=2026.5.7",
+]
+test = [
+    "pytest",
+]
+lint = [
+    "ruff>=0.12",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["biomlff"]
+
+[tool.uv.sources]
+openmmjax = { path = "../openmm-jax/build/python" }
+
+[tool.ruff]
+line-length = 99
+target-version = "py311"
+extend-exclude = [
+    "examples/data",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+"test/*.py" = ["E501"]
+
+[tool.pytest.ini_options]
+python_files = ["Test*.py"]
