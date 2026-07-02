@@ -165,7 +165,7 @@ class ANI2xPotentialImpl(MLPotentialImpl):
         force.setUsesPeriodicBoundaryConditions(forcePeriodic)
         if atoms is not None:
             force.setParticles(atoms)
-        force.addToSystem(system)
+        system.addForce(force)
 
 
 for model_name in ANI2X_MODEL_NAMES:

@@ -188,7 +188,7 @@ class OrbPotentialImpl(MLPotentialImpl):
         force.setUsesPeriodicBoundaryConditions(forcePeriodic)
         if atoms is not None:
             force.setParticles(atoms)
-        force.addToSystem(system)
+        system.addForce(force)
 
 
 for model_name in ORB_MODEL_NAMES:

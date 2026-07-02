@@ -146,7 +146,7 @@ class MACEPotentialImpl(MLPotentialImpl):
         force.setUsesPeriodicBoundaryConditions(forcePeriodic)
         if atoms is not None:
             force.setParticles(atoms)
-        force.addToSystem(system)
+        system.addForce(force)
 
 
 for model_name in MACE_MODEL_NAMES:

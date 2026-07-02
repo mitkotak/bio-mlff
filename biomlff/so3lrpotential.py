@@ -161,7 +161,7 @@ class SO3LRPotentialImpl(MLPotentialImpl):
         force.setUsesPeriodicBoundaryConditions(force_periodic)
         if atoms is not None:
             force.setParticles(atoms)
-        force.addToSystem(system)
+        system.addForce(force)
 
 
 for model_name in SO3LR_MODEL_NAMES:
