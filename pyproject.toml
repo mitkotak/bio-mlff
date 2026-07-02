@@ -47,3 +47,8 @@ select = ["E", "F", "I"]
 
 [tool.pytest.ini_options]
 python_files = ["Test*.py"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

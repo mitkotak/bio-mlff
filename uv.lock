@@ -92,6 +92,11 @@ test = [
     { name = "pytest" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "equinox", specifier = ">=0.13.8" },
@@ -107,6 +112,9 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'lint'", specifier = ">=0.12" },
 ]
 provides-extras = ["fennix", "test", "lint"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=9.1.1" }]
 
 [[package]]
 name = "certifi"
