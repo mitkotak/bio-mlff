@@ -488,8 +488,8 @@ class ZBLRepulsion(eqx.Module):
         num_atoms = species.shape[0]
         distances = safe_norm(edge_vectors, axis=-1)
         safe_distances = jnp.maximum(distances, 1.0e-7)
-        z_sender = species[senders]
-        z_receiver = species[receivers]
+        z_sender = species[senders] + 1
+        z_receiver = species[receivers] + 1
         z_sender_f = z_sender.astype(positions.dtype)
         z_receiver_f = z_receiver.astype(positions.dtype)
 
