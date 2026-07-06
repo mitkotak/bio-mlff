@@ -16,6 +16,8 @@ from jax import Array
 from jax.scipy.special import erfc
 from jax_md import partition, space
 
+jax.config.update("jax_default_matmul_precision", "highest")
+
 AIMNET2_MODEL_PATHS = {
     "aimnet2-jax": Path(__file__).resolve().with_name("aimnet2.eqx"),
 }
@@ -152,6 +154,7 @@ class Linear(eqx.Module):
             raise ValueError(
                 f"Expected feature axis of size {self.in_dim}, got shape {x.shape}."
             )
+        x = x.astype(self.weight.dtype)
         return x @ self.weight.T + self.bias
 
 
@@ -762,6 +765,11 @@ class AIMNet2(eqx.Module):
     ) -> tuple[Array, Array, Array, Array, Array]:
         """Return local node energies plus intermediates needed by global terms."""
 
+        model_dtype = self.layer.afv.dtype
+        positions = positions.astype(model_dtype)
+        if box_vectors is not None:
+            box_vectors = box_vectors.astype(model_dtype)
+        total_charge = jnp.asarray(total_charge, dtype=model_dtype)
         species = jnp.asarray(species, dtype=jnp.int32)
         local_vectors, neighbors, edge_mask = dense_neighbor_edges(
             positions,
@@ -830,6 +838,10 @@ class AIMNet2(eqx.Module):
 
         box_vectors = box_vectors if periodic else None
         with jax.enable_x64(True):
+            positions64 = positions.astype(jnp.float64)
+            box_vectors64 = (
+                box_vectors.astype(jnp.float64) if box_vectors is not None else None
+            )
             (
                 node_energies,
                 partial_charges,
@@ -837,33 +849,33 @@ class AIMNet2(eqx.Module):
                 neighbors,
                 edge_mask,
             ) = self.local_node_energies_and_charges(
-                positions,
+                positions64,
                 species,
                 neighbor_idx=neighbor_idx,
                 total_charge=total_charge,
-                box_vectors=box_vectors,
+                box_vectors=box_vectors64,
             )
             local_energy = jnp.sum(node_energies)
             coulomb_energy = self.coulomb_energy(
                 partial_charges,
-                positions,
+                positions64,
                 r_ij,
                 neighbors,
                 edge_mask,
                 lr_neighbor_idx,
-                box_vectors,
+                box_vectors64,
             )
             dispersion_energy = d3bj_energy_neighbors(
-                positions,
+                positions64,
                 d3_data,
                 lr_neighbor_idx,
-                box_vectors=box_vectors,
+                box_vectors=box_vectors64,
                 cutoff=float(self.lr_cutoff),
                 smoothing_fraction=float(self.d3_smoothing_fraction),
             ).astype(jnp.float64)
 
             total_energy = local_energy + coulomb_energy + dispersion_energy
-            return total_energy.astype(jnp.float32)
+            return total_energy.astype(jnp.float64)
 
 def load_model(
     model: str | PathLike = "aimnet2-jax",

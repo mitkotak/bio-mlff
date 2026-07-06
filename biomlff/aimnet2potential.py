@@ -72,6 +72,7 @@ class AIMNet2PotentialImpl(MLPotentialImpl):
         multiplicity: Optional[int] = None,
         preprocessing_positions=None,
         preprocessing_positions_unit=unit.nanometer,
+        use_float64: bool = False,
         **args,
     ):
         multiplicity = self.multiplicity if multiplicity is None else multiplicity
@@ -177,22 +178,31 @@ class AIMNet2PotentialImpl(MLPotentialImpl):
             return energy_fn((positions_nm, box_vectors_nm))
 
         def _energy_and_forces_kjmol(positions_nm, box_vectors_nm=None):
-            energy, minus_forces = jax.value_and_grad(_energy_kjmol)(
-                positions_nm,
-                box_vectors_nm,
-            )
+            with jax.enable_x64(True):
+                energy, minus_forces = jax.value_and_grad(_energy_kjmol)(
+                    positions_nm,
+                    box_vectors_nm,
+                )
             return energy, -minus_forces
 
         def _forces_kjmol(positions_nm, box_vectors_nm=None):
-            return -jax.grad(_energy_kjmol)(positions_nm, box_vectors_nm)
+            with jax.enable_x64(True):
+                return -jax.grad(_energy_kjmol)(positions_nm, box_vectors_nm)
 
-        force_mlir, energy_mlir, energy_and_forces_mlir, compile_options_base64 = export_jax_model(
-            num_model_atoms=numModelAtoms,
-            force_function=_forces_kjmol,
-            energy_function=_energy_kjmol,
-            energy_and_forces_function=_energy_and_forces_kjmol,
-            periodic=forcePeriodic,
-        )
+        with jax.enable_x64(use_float64):
+            (
+                force_mlir,
+                energy_mlir,
+                energy_and_forces_mlir,
+                compile_options_base64,
+            ) = export_jax_model(
+                num_model_atoms=numModelAtoms,
+                force_function=_forces_kjmol,
+                energy_function=_energy_kjmol,
+                energy_and_forces_function=_energy_and_forces_kjmol,
+                periodic=forcePeriodic,
+                input_dtype=jnp.float64 if use_float64 else jnp.float32,
+            )
         force = openmmjax.JaxForce(
             force_mlir,
             energy_mlir,
@@ -250,18 +260,20 @@ def _energyAIMNet2(
 ):
     """Evaluate AIMNet2 energy in kJ/mol from OpenMM positions in nm."""
     positions_nm, box_vectors_nm = state
-    positions = positions_nm * unit.nanometer.conversion_factor_to(unit.angstrom)
-    box_vectors = None
-    if pbc and box_vectors_nm is not None:
-        box_vectors = box_vectors_nm * unit.nanometer.conversion_factor_to(unit.angstrom)
-    energy = model(
-        positions,
-        species,
-        d3_data=d3_data,
-        box_vectors=box_vectors,
-        neighbors=neighbor_list,
-        lr_neighbors=lr_neighbor_list,
-        periodic=pbc,
-        total_charge=total_charge,
-    )
+    with jax.enable_x64(True):
+        angstrom_per_nm = unit.nanometer.conversion_factor_to(unit.angstrom)
+        positions = (positions_nm * angstrom_per_nm).astype(jnp.float64)
+        box_vectors = None
+        if pbc and box_vectors_nm is not None:
+            box_vectors = (box_vectors_nm * angstrom_per_nm).astype(jnp.float64)
+        energy = model(
+            positions,
+            species,
+            d3_data=d3_data,
+            box_vectors=box_vectors,
+            neighbors=neighbor_list,
+            lr_neighbors=lr_neighbor_list,
+            periodic=pbc,
+            total_charge=total_charge,
+        )
     return energy * model.ev_to_kjmol
