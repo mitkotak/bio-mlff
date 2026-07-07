@@ -30,6 +30,9 @@ DATA_DIR = Path(__file__).resolve().parent
 EV_TO_KJMOL = (unit.elementary_charge * unit.volt * unit.AVOGADRO_CONSTANT_NA).value_in_unit(
     unit.kilojoules_per_mole
 )
+EV_A_TO_KJMOL_NM = (
+    unit.elementary_charge * unit.volt / unit.angstrom * unit.AVOGADRO_CONSTANT_NA
+).value_in_unit(unit.kilojoules_per_mole / unit.nanometer)
 MODEL = "so3lr"
 SYSTEMS = {
     "toluene": DATA_DIR / "toluene" / "toluene.pdb",
@@ -39,7 +42,7 @@ SYSTEMS = {
 }
 
 
-def calculate_energy(path: Path) -> float:
+def calculate_reference(path: Path, *, include_forces: bool = True) -> dict[str, float | np.ndarray]:
     atoms = ase.io.read(path)
     atoms.info["charge"] = 0.0
     atoms.calc = So3lrCalculator(
@@ -47,15 +50,27 @@ def calculate_energy(path: Path) -> float:
         lr_cutoff=12.0,
         dtype=np.float32,
     )
-    return atoms.get_potential_energy() * EV_TO_KJMOL
+    reference: dict[str, float | np.ndarray] = {
+        "energy": atoms.get_potential_energy() * EV_TO_KJMOL,
+    }
+    if include_forces:
+        reference["forces"] = atoms.get_forces() * EV_A_TO_KJMOL_NM
+    return reference
 
 
-def calculate_results() -> dict[str, float]:
-    return {f"{system}/{MODEL}": calculate_energy(path) for system, path in SYSTEMS.items()}
+def calculate_results() -> dict[str, float | np.ndarray]:
+    results = {}
+    for system, path in SYSTEMS.items():
+        reference = calculate_reference(path)
+        results[f"{system}/{MODEL}"] = reference["energy"]
+        results[f"{system}/{MODEL}/forces"] = reference["forces"]
+    return results
 
 
-def print_results(results: dict[str, float]) -> None:
+def print_results(results: dict[str, float | np.ndarray]) -> None:
     for key, value in results.items():
+        if isinstance(value, np.ndarray):
+            value = np.array2string(value, precision=12, separator=", ", threshold=np.inf)
         print(f"{key}: {value!r}")
 
 

@@ -1,11 +1,12 @@
 # /// script
-# dependencies = ["ase", "huggingface-hub", "openmm", "torchmd-net"]
+# dependencies = ["ase", "huggingface-hub", "numpy", "openmm", "torchmd-net"]
 # ///
-# This script computes AceFF reference energies from upstream TorchMD-Net checkpoints.
+# This script computes AceFF reference energies and forces from upstream TorchMD-Net checkpoints.
 
 from pathlib import Path
 
 import ase.io
+import numpy as np
 from huggingface_hub import hf_hub_download
 from openmm import unit
 from torchmdnet.calculators import TMDNETCalculator
@@ -14,6 +15,9 @@ DATA_DIR = Path(__file__).resolve().parent
 EV_TO_KJMOL = (unit.elementary_charge * unit.volt * unit.AVOGADRO_CONSTANT_NA).value_in_unit(
     unit.kilojoules_per_mole
 )
+EV_A_TO_KJMOL_NM = (
+    unit.elementary_charge * unit.volt / unit.angstrom * unit.AVOGADRO_CONSTANT_NA
+).value_in_unit(unit.kilojoules_per_mole / unit.nanometer)
 SYSTEMS = {
     "toluene": DATA_DIR / "toluene" / "toluene.pdb",
     "alanine-dipeptide-explicit": DATA_DIR
@@ -34,7 +38,12 @@ MODELS = {
 }
 
 
-def calculate_energy(path: Path, model_name: str) -> float:
+def calculate_reference(
+    path: Path,
+    model_name: str,
+    *,
+    include_forces: bool = True,
+) -> dict[str, float | np.ndarray]:
     repo_id, filename, kwargs = MODELS[model_name]
     model_file = hf_hub_download(
         repo_id=repo_id,
@@ -50,21 +59,30 @@ def calculate_energy(path: Path, model_name: str) -> float:
         max_num_neighbors=min(64, len(atoms)),
         **kwargs,
     )
-    return atoms.get_potential_energy() * EV_TO_KJMOL
+    reference: dict[str, float | np.ndarray] = {
+        "energy": atoms.get_potential_energy() * EV_TO_KJMOL,
+    }
+    if include_forces:
+        reference["forces"] = atoms.get_forces() * EV_A_TO_KJMOL_NM
+    return reference
 
 
-def calculate_results() -> dict[str, float]:
+def calculate_results() -> dict[str, float | np.ndarray]:
     results = {}
 
     for system_name, path in SYSTEMS.items():
         for model_name in MODELS:
-            results[f"{system_name}/{model_name}"] = calculate_energy(path, model_name)
+            reference = calculate_reference(path, model_name)
+            results[f"{system_name}/{model_name}"] = reference["energy"]
+            results[f"{system_name}/{model_name}/forces"] = reference["forces"]
 
     return results
 
 
-def print_results(results: dict[str, float]) -> None:
+def print_results(results: dict[str, float | np.ndarray]) -> None:
     for key, value in results.items():
+        if isinstance(value, np.ndarray):
+            value = np.array2string(value, precision=12, separator=", ", threshold=np.inf)
         print(f"{key}: {value!r}")
 
 
