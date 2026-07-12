@@ -14,9 +14,9 @@ DATA_DIR = Path(__file__).resolve().parent
 EV_TO_KJMOL = (unit.elementary_charge * unit.volt * unit.AVOGADRO_CONSTANT_NA).value_in_unit(
     unit.kilojoules_per_mole
 )
-EV_A_TO_KJMOL_NM = (
+EV_A_TO_KJMOL_A = (
     unit.elementary_charge * unit.volt / unit.angstrom * unit.AVOGADRO_CONSTANT_NA
-).value_in_unit(unit.kilojoules_per_mole / unit.nanometer)
+).value_in_unit(unit.kilojoules_per_mole / unit.angstrom)
 SYSTEMS = {
     "toluene": DATA_DIR / "toluene" / "toluene.pdb",
     "alanine-dipeptide-explicit": DATA_DIR
@@ -38,12 +38,12 @@ def calculate_reference(
     include_forces: bool = True,
 ) -> dict[str, float | np.ndarray]:
     atoms = ase.io.read(path)
-    atoms.calc = mace_off(checkpoint, device="cpu", default_dtype="float32")
+    atoms.calc = mace_off(checkpoint, device="cuda", default_dtype="float32")
     reference: dict[str, float | np.ndarray] = {
         "energy": atoms.get_potential_energy() * EV_TO_KJMOL,
     }
     if include_forces:
-        reference["forces"] = atoms.get_forces() * EV_A_TO_KJMOL_NM
+        reference["forces"] = atoms.get_forces() * EV_A_TO_KJMOL_A
     return reference
 
 

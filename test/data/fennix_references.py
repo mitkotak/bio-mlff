@@ -1,5 +1,5 @@
 # /// script
-# dependencies = ["ase", "fennol", "numpy", "openmm"]
+# dependencies = ["ase", "fennol", "jax[cuda13]", "numpy", "openmm"]
 # ///
 # This script computes reference energies for the FeNNix models.
 
@@ -17,9 +17,9 @@ DATA_DIR = Path(__file__).resolve().parent
 EV_TO_KJMOL = (unit.elementary_charge * unit.volt * unit.AVOGADRO_CONSTANT_NA).value_in_unit(
     unit.kilojoules_per_mole
 )
-EV_A_TO_KJMOL_NM = (
+EV_A_TO_KJMOL_A = (
     unit.elementary_charge * unit.volt / unit.angstrom * unit.AVOGADRO_CONSTANT_NA
-).value_in_unit(unit.kilojoules_per_mole / unit.nanometer)
+).value_in_unit(unit.kilojoules_per_mole / unit.angstrom)
 SYSTEMS = {
     "toluene": DATA_DIR / "toluene" / "toluene.pdb",
     "methanol-ions": DATA_DIR / "methanol-ions" / "methanol-ions.pdb",
@@ -69,7 +69,7 @@ def calculate_reference(
         "energy": atoms.get_potential_energy() * EV_TO_KJMOL,
     }
     if include_forces:
-        reference["forces"] = atoms.get_forces() * EV_A_TO_KJMOL_NM
+        reference["forces"] = atoms.get_forces() * EV_A_TO_KJMOL_A
     return reference
 
 

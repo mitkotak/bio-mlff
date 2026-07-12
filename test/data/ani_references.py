@@ -15,9 +15,9 @@ DATA_DIR = Path(__file__).resolve().parent
 HARTREE_TO_KJMOL = (unit.hartree * unit.AVOGADRO_CONSTANT_NA).value_in_unit(
     unit.kilojoules_per_mole
 )
-HARTREE_A_TO_KJMOL_NM = (
+HARTREE_A_TO_KJMOL_A = (
     unit.hartree * unit.AVOGADRO_CONSTANT_NA / unit.angstrom
-).value_in_unit(unit.kilojoules_per_mole / unit.nanometer)
+).value_in_unit(unit.kilojoules_per_mole / unit.angstrom)
 SYSTEMS = {
     "toluene": DATA_DIR / "toluene" / "toluene.pdb",
 }
@@ -26,8 +26,10 @@ MODELS = ("ani2x-jax-model0", "ani2x-jax-ensemble")
 
 def calculate_reference(path: Path, model_name: str) -> dict[str, float | np.ndarray]:
     atoms = ase.io.read(path)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float64
+    if not torch.cuda.is_available():
+        raise RuntimeError("ANI reference generation requires a CUDA GPU")
+    device = torch.device("cuda")
+    dtype = torch.float32
     model = torchani.models.ANI2x(periodic_table_index=True).to(device=device, dtype=dtype)
     species = torch.tensor(
         atoms.get_atomic_numbers(),
@@ -47,7 +49,7 @@ def calculate_reference(path: Path, model_name: str) -> dict[str, float | np.nda
     else:
         energy = result.energies.squeeze()
     gradient = torch.autograd.grad(energy, coordinates)[0]
-    forces = (-gradient.squeeze(0) * HARTREE_A_TO_KJMOL_NM).detach().cpu().numpy()
+    forces = (-gradient.squeeze(0) * HARTREE_A_TO_KJMOL_A).detach().cpu().numpy()
     return {
         "energy": float(energy.detach().cpu().numpy() * HARTREE_TO_KJMOL),
         "forces": forces,

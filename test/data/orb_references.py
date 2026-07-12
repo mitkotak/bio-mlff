@@ -19,9 +19,9 @@ DATA_DIR = Path(__file__).resolve().parent
 EV_TO_KJMOL = (unit.elementary_charge * unit.volt * unit.AVOGADRO_CONSTANT_NA).value_in_unit(
     unit.kilojoules_per_mole
 )
-EV_A_TO_KJMOL_NM = (
+EV_A_TO_KJMOL_A = (
     unit.elementary_charge * unit.volt / unit.angstrom * unit.AVOGADRO_CONSTANT_NA
-).value_in_unit(unit.kilojoules_per_mole / unit.nanometer)
+).value_in_unit(unit.kilojoules_per_mole / unit.angstrom)
 SYSTEMS = {
     "toluene": DATA_DIR / "toluene" / "toluene.pdb",
     "alanine-dipeptide-explicit": DATA_DIR
@@ -38,8 +38,8 @@ def make_calculator():
     pretrained = orb.ORB_PRETRAINED_MODELS[MODEL](precision=MODEL_PRECISION)
     if isinstance(pretrained, tuple):
         orbff, atoms_adapter = pretrained
-        return ORBCalculator(orbff, atoms_adapter=atoms_adapter)
-    return ORBCalculator(pretrained)
+        return ORBCalculator(orbff, atoms_adapter=atoms_adapter, device="cuda")
+    return ORBCalculator(pretrained, device="cuda")
 
 
 def calculate_reference(
@@ -57,7 +57,7 @@ def calculate_reference(
         "energy": atoms.get_potential_energy() * EV_TO_KJMOL,
     }
     if include_forces:
-        reference["forces"] = atoms.get_forces() * EV_A_TO_KJMOL_NM
+        reference["forces"] = atoms.get_forces() * EV_A_TO_KJMOL_A
     return reference
 
 

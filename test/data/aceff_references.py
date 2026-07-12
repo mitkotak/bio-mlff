@@ -1,5 +1,11 @@
 # /// script
-# dependencies = ["ase", "huggingface-hub", "numpy", "openmm", "torchmd-net"]
+# dependencies = [
+#   "ase",
+#   "huggingface-hub",
+#   "numpy",
+#   "openmm",
+#   "torchmd-net @ git+https://github.com/torchmd/torchmd-net.git@2a2c913352a8b5fd297a33dd0ec35c4d69fb1eea",
+# ]
 # ///
 # This script computes AceFF reference energies and forces from upstream TorchMD-Net checkpoints.
 
@@ -15,9 +21,9 @@ DATA_DIR = Path(__file__).resolve().parent
 EV_TO_KJMOL = (unit.elementary_charge * unit.volt * unit.AVOGADRO_CONSTANT_NA).value_in_unit(
     unit.kilojoules_per_mole
 )
-EV_A_TO_KJMOL_NM = (
+EV_A_TO_KJMOL_A = (
     unit.elementary_charge * unit.volt / unit.angstrom * unit.AVOGADRO_CONSTANT_NA
-).value_in_unit(unit.kilojoules_per_mole / unit.nanometer)
+).value_in_unit(unit.kilojoules_per_mole / unit.angstrom)
 SYSTEMS = {
     "toluene": DATA_DIR / "toluene" / "toluene.pdb",
     "alanine-dipeptide-explicit": DATA_DIR
@@ -54,16 +60,14 @@ def calculate_reference(
     atoms.info["charge"] = 0
     atoms.calc = TMDNETCalculator(
         model_file,
-        device="cpu",
-        remove_ref_energy=True,
-        max_num_neighbors=min(64, len(atoms)),
+        device="cuda",
         **kwargs,
     )
     reference: dict[str, float | np.ndarray] = {
         "energy": atoms.get_potential_energy() * EV_TO_KJMOL,
     }
     if include_forces:
-        reference["forces"] = atoms.get_forces() * EV_A_TO_KJMOL_NM
+        reference["forces"] = atoms.get_forces() * EV_A_TO_KJMOL_A
     return reference
 
 
