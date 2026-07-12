@@ -106,7 +106,7 @@ requires-dist = [
     { name = "jaxlib" },
     { name = "numpy" },
     { name = "openmm", specifier = ">=8.5.2" },
-    { name = "openmmjax-cu12", specifier = ">=0.1" },
+    { name = "openmmjax-cu12", specifier = ">=0.1.3.2" },
     { name = "openmmml", specifier = ">=1.7" },
     { name = "pytest", marker = "extra == 'test'" },
     { name = "ruff", marker = "extra == 'lint'", specifier = ">=0.12" },
@@ -1549,7 +1549,7 @@ wheels = [
 
 [[package]]
 name = "openmmjax-cu12"
-version = "0.1.3"
+version = "0.1.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jax", extra = ["cuda12"] },
@@ -1559,8 +1559,8 @@ dependencies = [
     { name = "openmm-cuda-12" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/73/e2/f6091472798d24e1e8524ca0dc0afa18678c77feb15bf0994edab75f9e99/openmmjax_cu12-0.1.3-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "sha256:af5f174e5c9a503049bfa0c61f379cb65b561192650c7a2497a367361f3df67e", size = 131123, upload-time = "2026-07-02T00:49:02.471Z" },
-    { url = "https://files.pythonhosted.org/packages/30/df/720a4e266244789821d3ad8c1e6e89d77ece95c055f530663bdf91777e1d/openmmjax_cu12-0.1.3-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:61b5673c889e97dc98c043e3b99618331b1414e0cb92c5a6ec9edd4680b60d6a", size = 131545, upload-time = "2026-07-02T00:49:03.566Z" },
+    { url = "https://files.pythonhosted.org/packages/75/b0/1394790bcacad84f065168147746bc694d5f1a031274f30cf5320f852067/openmmjax_cu12-0.1.4-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "sha256:f7595d9b99e6eada724a0d0bcdebb830fc2c2c3fb0fe6394e154755571ee27b0", size = 133799, upload-time = "2026-07-08T14:35:49.799Z" },
+    { url = "https://files.pythonhosted.org/packages/d6/31/0ef45d0fcbe8ea15ca20df2fa89b3510154a99952ea40a4f33dbf58c8266/openmmjax_cu12-0.1.4-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:c2a1701177a2e512f4211d1df679999ea73c7f2017adec5a70a2c3d79c197287", size = 134276, upload-time = "2026-07-08T14:35:50.96Z" },
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
 # /// script
-# dependencies = ["ase", "fennol", "numpy", "openmm"]
+# dependencies = ["ase", "fennol", "jax[cuda13]", "numpy", "openmm"]
 # ///
 # This script computes reference energies for the FeNNix models.
 
@@ -9,6 +9,7 @@ import urllib.request
 from pathlib import Path
 
 import ase.io
+import numpy as np
 from fennol.ase import FENNIXCalculator
 from openmm import unit
 
@@ -16,6 +17,9 @@ DATA_DIR = Path(__file__).resolve().parent
 EV_TO_KJMOL = (unit.elementary_charge * unit.volt * unit.AVOGADRO_CONSTANT_NA).value_in_unit(
     unit.kilojoules_per_mole
 )
+EV_A_TO_KJMOL_A = (
+    unit.elementary_charge * unit.volt / unit.angstrom * unit.AVOGADRO_CONSTANT_NA
+).value_in_unit(unit.kilojoules_per_mole / unit.angstrom)
 SYSTEMS = {
     "toluene": DATA_DIR / "toluene" / "toluene.pdb",
     "methanol-ions": DATA_DIR / "methanol-ions" / "methanol-ions.pdb",
@@ -50,38 +54,60 @@ def model_path(model: str) -> str:
     return str(path)
 
 
-def calculate_energy(path: Path, model_name: str, charges: list[int] | None = None) -> float:
+def calculate_reference(
+    path: Path,
+    model_name: str,
+    charges: list[int] | None = None,
+    *,
+    include_forces: bool = True,
+) -> dict[str, float | np.ndarray]:
     atoms = ase.io.read(path)
     if charges is not None:
         atoms.set_initial_charges(charges)
     atoms.calc = FENNIXCalculator(model_path(model_name), use_float64=True)
-    return atoms.get_potential_energy() * EV_TO_KJMOL
+    reference: dict[str, float | np.ndarray] = {
+        "energy": atoms.get_potential_energy() * EV_TO_KJMOL,
+    }
+    if include_forces:
+        reference["forces"] = atoms.get_forces() * EV_A_TO_KJMOL_A
+    return reference
 
 
-def calculate_results() -> dict[str, float]:
+def calculate_results() -> dict[str, float | np.ndarray]:
     results = {}
 
     for model_name in TOLUENE_MODELS:
-        results[f"toluene/{model_name}"] = calculate_energy(SYSTEMS["toluene"], model_name)
+        reference = calculate_reference(
+            SYSTEMS["toluene"],
+            model_name,
+        )
+        results[f"toluene/{model_name}"] = reference["energy"]
+        results[f"toluene/{model_name}/forces"] = reference["forces"]
 
     for model_name in ION_MODELS:
-        results[f"methanol-ions/{model_name}"] = calculate_energy(
+        reference = calculate_reference(
             SYSTEMS["methanol-ions"],
             model_name,
             charges=ION_CHARGES,
         )
+        results[f"methanol-ions/{model_name}"] = reference["energy"]
+        results[f"methanol-ions/{model_name}/forces"] = reference["forces"]
 
     for model_name in ALANINE_DIPEPTIDE_MODELS:
-        results[f"alanine-dipeptide-explicit/{model_name}"] = calculate_energy(
+        reference = calculate_reference(
             SYSTEMS["alanine-dipeptide-explicit"],
             model_name,
         )
+        results[f"alanine-dipeptide-explicit/{model_name}"] = reference["energy"]
+        results[f"alanine-dipeptide-explicit/{model_name}/forces"] = reference["forces"]
 
     return results
 
 
-def print_results(results: dict[str, float]) -> None:
+def print_results(results: dict[str, float | np.ndarray]) -> None:
     for key, value in results.items():
+        if isinstance(value, np.ndarray):
+            value = np.array2string(value, precision=12, separator=", ", threshold=np.inf)
         print(f"{key}: {value!r}")
 
 
