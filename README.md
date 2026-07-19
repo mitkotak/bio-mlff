@@ -1,6 +1,8 @@
 # Bio-MLFF
 
- Machine Learning Force Fields in JAX using [Openmm-JAX's JaxForce](https://github.com/mitkotak/openmm-jax)
+ ** Migrating this repo to JAX-MD. Follow [here](https://github.com/jax-md/jax-md/pulls) **
+
+ Machine Learning Force Fields in JAX using [Openmm-JAX's JaxForce](https://github.com/mitkotak/openmm-jax).
 
 ```bash
 pip install bio-mlff
