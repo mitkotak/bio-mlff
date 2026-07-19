@@ -17,7 +17,7 @@ potential = MLPotential("ani2x-jax-model0")
 
 ## Supported Models
 
-Except FeNNix, all the models are implemented from scratch with JAX-MD and Equinox as the only dependencies.
+Except FeNNix, all the models are implemented from scratch (with conversion tests) with JAX-MD and Equinox as the only dependencies.
 
 - `fennix-bio1-small`, `fennix-bio1-medium`
 - `ani2x-jax-model0`, `ani2x-jax-ensemble` 
