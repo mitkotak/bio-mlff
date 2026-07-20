@@ -7,23 +7,17 @@
 #   "torchmd-net @ git+https://github.com/torchmd/torchmd-net.git@2a2c913352a8b5fd297a33dd0ec35c4d69fb1eea",
 # ]
 # ///
-# This script computes AceFF reference energies and forces from upstream TorchMD-Net checkpoints.
 
 from pathlib import Path
 
 import ase.io
 import numpy as np
+import torch
 from huggingface_hub import hf_hub_download
-from openmm import unit
-from torchmdnet.calculators import TMDNETCalculator
+from reference_utils import EV_A_TO_KJMOL_A, EV_TO_KJMOL
+from torchmdnet.models.model import load_model
 
 DATA_DIR = Path(__file__).resolve().parent
-EV_TO_KJMOL = (unit.elementary_charge * unit.volt * unit.AVOGADRO_CONSTANT_NA).value_in_unit(
-    unit.kilojoules_per_mole
-)
-EV_A_TO_KJMOL_A = (
-    unit.elementary_charge * unit.volt / unit.angstrom * unit.AVOGADRO_CONSTANT_NA
-).value_in_unit(unit.kilojoules_per_mole / unit.angstrom)
 SYSTEMS = {
     "toluene": DATA_DIR / "toluene" / "toluene.pdb",
     "alanine-dipeptide-explicit": DATA_DIR
@@ -31,11 +25,7 @@ SYSTEMS = {
     / "alanine-dipeptide-explicit.pdb",
 }
 MODELS = {
-    "aceff-jax-1.1": (
-        "Acellera/AceFF-1.1",
-        "aceff_v1.1.ckpt",
-        {},
-    ),
+    "aceff-jax-1.1": ("Acellera/AceFF-1.1", "aceff_v1.1.ckpt", {}),
     "aceff-jax-2.0": (
         "Acellera/AceFF-2.0",
         "aceff_v2.0.ckpt",
@@ -45,53 +35,62 @@ MODELS = {
 
 
 def calculate_reference(
-    path: Path,
-    model_name: str,
-    *,
-    include_forces: bool = True,
+    structure_path: Path,
+    model: torch.nn.Module,
 ) -> dict[str, float | np.ndarray]:
-    repo_id, filename, kwargs = MODELS[model_name]
-    model_file = hf_hub_download(
-        repo_id=repo_id,
-        filename=filename,
+    atoms = ase.io.read(structure_path)
+    positions = torch.as_tensor(atoms.positions, device="cuda", dtype=torch.float64)
+    atomic_numbers = torch.as_tensor(atoms.numbers, device="cuda", dtype=torch.long)
+    batch = torch.zeros(len(atoms), device="cuda", dtype=torch.long)
+    charge = torch.zeros(1, device="cuda", dtype=torch.float64)
+    box_vectors = (
+        torch.as_tensor(atoms.cell.array, device="cuda", dtype=torch.float64)
+        if atoms.pbc.any()
+        else None
     )
-
-    atoms = ase.io.read(path)
-    atoms.info["charge"] = 0
-    atoms.calc = TMDNETCalculator(
-        model_file,
-        device="cuda",
-        **kwargs,
+    energy, forces = model(
+        atomic_numbers,
+        positions,
+        batch=batch,
+        q=charge,
+        box=box_vectors,
     )
-    reference: dict[str, float | np.ndarray] = {
-        "energy": atoms.get_potential_energy() * EV_TO_KJMOL,
+    return {
+        "energy": np.float64(energy.detach().sum().cpu().item() * EV_TO_KJMOL).item(),
+        "forces": np.asarray(
+            forces.detach().cpu().numpy() * EV_A_TO_KJMOL_A,
+            dtype=np.float64,
+        ),
     }
-    if include_forces:
-        reference["forces"] = atoms.get_forces() * EV_A_TO_KJMOL_A
-    return reference
-
-
-def calculate_results() -> dict[str, float | np.ndarray]:
-    results = {}
-
-    for system_name, path in SYSTEMS.items():
-        for model_name in MODELS:
-            reference = calculate_reference(path, model_name)
-            results[f"{system_name}/{model_name}"] = reference["energy"]
-            results[f"{system_name}/{model_name}/forces"] = reference["forces"]
-
-    return results
-
-
-def print_results(results: dict[str, float | np.ndarray]) -> None:
-    for key, value in results.items():
-        if isinstance(value, np.ndarray):
-            value = np.array2string(value, precision=12, separator=", ", threshold=np.inf)
-        print(f"{key}: {value!r}")
 
 
 def main() -> None:
-    print_results(calculate_results())
+    results: dict[str, float | np.ndarray] = {}
+    for model_name, (repo_id, filename, model_kwargs) in MODELS.items():
+        checkpoint_path = hf_hub_download(repo_id=repo_id, filename=filename)
+        model = load_model(
+            checkpoint_path,
+            device="cuda",
+            derivative=True,
+            precision=64,
+            remove_ref_energy=True,
+            max_num_neighbors=64,
+            static_shapes=False,
+            **model_kwargs,
+        ).eval()
+        model.requires_grad_(False)
+        for system_name, structure_path in SYSTEMS.items():
+            reference = calculate_reference(structure_path, model)
+            result_key = f"{system_name}/{model_name}"
+            results[result_key] = reference["energy"]
+            results[f"{result_key}/forces"] = reference["forces"]
+
+    for key, value in results.items():
+        if isinstance(value, np.ndarray):
+            value = np.array2string(value, precision=17, separator=", ", threshold=np.inf)
+            print(f"{key}: np.array({value}, dtype=np.float64)")
+        else:
+            print(f"{key}: {value!r}")
 
 
 if __name__ == "__main__":

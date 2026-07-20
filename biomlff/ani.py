@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import json
+import math
 from os import PathLike
 from pathlib import Path
+from typing import Any
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax_md import partition, space
-from openmm import unit
 
 jax.config.update("jax_default_matmul_precision", "highest")
 
@@ -20,24 +21,21 @@ ANI2X_MODEL_PATHS = {
     "ani2x-jax-model0": DEFAULT_SINGLE_MODEL_PATH,
 }
 ANI2X_MODEL_NAMES = tuple(ANI2X_MODEL_PATHS)
-HARTREE_TO_KJMOL = (unit.hartree * unit.AVOGADRO_CONSTANT_NA).value_in_unit(
-    unit.kilojoules_per_mole
-)
 
 
 def dense_neighbor_edges(
     positions,
-    neighbors,
+    neighbor_idx,
     *,
     box_vectors=None,
 ):
     num_atoms = positions.shape[0]
     atom_ids = jnp.arange(num_atoms, dtype=jnp.int32)
-    neighbors = jnp.asarray(neighbors, dtype=jnp.int32)
-    neighbor_mask = (neighbors >= 0) & (neighbors < num_atoms)
-    safe_neighbors = jnp.where(neighbor_mask, neighbors, atom_ids[:, None])
+    neighbor_idx = jnp.asarray(neighbor_idx, dtype=jnp.int32)
+    edge_mask = (neighbor_idx >= 0) & (neighbor_idx < num_atoms)
+    safe_neighbor_idx = jnp.where(edge_mask, neighbor_idx, atom_ids[:, None])
 
-    neighbor_positions = positions[safe_neighbors]
+    neighbor_positions = positions[safe_neighbor_idx]
     if box_vectors is None:
         edge_vectors = neighbor_positions - positions[:, None, :]
     else:
@@ -46,8 +44,8 @@ def dense_neighbor_edges(
             fractional_coordinates=False,
         )
         edge_vectors = space.map_neighbor(displacement)(positions, neighbor_positions)
-    edge_vectors = jnp.where(neighbor_mask[..., None], edge_vectors, 0.0)
-    return edge_vectors, safe_neighbors, neighbor_mask
+    edge_vectors = jnp.where(edge_mask[..., None], edge_vectors, 0.0)
+    return edge_vectors, safe_neighbor_idx, edge_mask
 
 
 def get_neighbors(
@@ -86,7 +84,6 @@ def get_neighbors(
         capacity_multiplier=float(cell_capacity_multiplier),
         disable_cell_list=not use_cell_list,
         mask_self=True,
-        fractional_coordinates=False,
         format=partition.NeighborListFormat.Dense,
     )
     return neighbor_fn.allocate(
@@ -97,7 +94,7 @@ def get_neighbors(
 
 def piecewise_cutoff(distance, cutoff: float):
     """ANI cosine cutoff."""
-    return 0.5 * jnp.cos(distance * jnp.pi / cutoff) + 0.5
+    return 0.5 * jnp.cos(distance * (math.pi / cutoff)) + 0.5
 
 
 class ANI2xCheckpoint(eqx.Module):
@@ -107,26 +104,33 @@ class ANI2xCheckpoint(eqx.Module):
     layer_weights: list
     layer_biases: list
 
-    def __init__(self, config: dict):
-        num_species = config["num_species"]
+    def __init__(
+        self,
+        config: dict,
+        *,
+        dtype: Any = jnp.float32,
+        atom_energy_dtype: Any | None = None,
+    ):
+        num_species = len(config["species_order"])
         num_models = config["num_models"]
         network_sizes = tuple(config["network_sizes"])
 
-        self.atom_energies = jnp.zeros(num_species, dtype=jnp.float32)
+        self.atom_energies = jnp.zeros(
+            num_species,
+            dtype=dtype if atom_energy_dtype is None else atom_energy_dtype,
+        )
         self.layer_weights = []
         self.layer_biases = []
         for layer_index in range(len(network_sizes) - 1):
             d_in = network_sizes[layer_index]
             d_out = network_sizes[layer_index + 1]
             self.layer_weights.append(
-                jnp.zeros((num_models, num_species, d_in, d_out), dtype=jnp.float32)
+                jnp.zeros((num_models, num_species, d_in, d_out), dtype=dtype)
             )
-            self.layer_biases.append(
-                jnp.zeros((num_models, num_species, d_out), dtype=jnp.float32)
-            )
+            self.layer_biases.append(jnp.zeros((num_models, num_species, d_out), dtype=dtype))
 
 
-def _active_pair_ids(
+def active_pair_ids(
     active_species: tuple[int, ...],
     pair_to_index: tuple[tuple[int, ...], ...],
 ) -> tuple[int, ...]:
@@ -138,14 +142,32 @@ def _active_pair_ids(
     )
 
 
-def _lookup_table(active_ids: tuple[int, ...], full_size: int) -> tuple[int, ...]:
+def lookup_table(active_ids: tuple[int, ...], full_size: int) -> tuple[int, ...]:
     active_ids_np = np.asarray(active_ids, dtype=np.int32)
     lookup = np.full(full_size, -1, dtype=np.int32)
     lookup[active_ids_np] = np.arange(len(active_ids_np), dtype=np.int32)
     return tuple(int(x) for x in lookup.tolist())
 
 
-def _basis_block_columns(
+def pair_index_table(num_species: int) -> tuple[tuple[int, ...], ...]:
+    table = np.zeros((num_species, num_species), dtype=np.int32)
+    pair_index = 0
+    for species_i in range(num_species):
+        for species_j in range(species_i, num_species):
+            table[species_i, species_j] = pair_index
+            table[species_j, species_i] = pair_index
+            pair_index += 1
+    return tuple(tuple(int(index) for index in row) for row in table)
+
+
+def species_index_table(species_order: tuple[int, ...]) -> tuple[int, ...]:
+    table = [-1] * (max(species_order) + 1)
+    for species_index, atomic_number in enumerate(species_order):
+        table[atomic_number] = species_index
+    return tuple(table)
+
+
+def basis_block_columns(
     active_ids: tuple[int, ...],
     block_width: int,
     *,
@@ -157,7 +179,7 @@ def _basis_block_columns(
     return (offset + block_offsets + block_columns).reshape(-1)
 
 
-def _first_layer_columns(
+def first_layer_columns(
     active_species: tuple[int, ...],
     active_pairs: tuple[int, ...],
     *,
@@ -165,8 +187,8 @@ def _first_layer_columns(
     radial_divisions: int,
     angular_basis_width: int,
 ) -> np.ndarray:
-    radial_cols = _basis_block_columns(active_species, radial_divisions)
-    angular_cols = _basis_block_columns(
+    radial_cols = basis_block_columns(active_species, radial_divisions)
+    angular_cols = basis_block_columns(
         active_pairs,
         angular_basis_width,
         offset=num_species * radial_divisions,
@@ -193,13 +215,8 @@ class ANI2x(eqx.Module):
     angular_radial_shifts: tuple[float, ...] = eqx.field(static=True)
     species_to_index: tuple[int, ...] = eqx.field(static=True)
     pair_to_index: tuple[tuple[int, ...], ...] = eqx.field(static=True)
-    radial_divisions: int = eqx.field(static=True)
-    angular_basis_width: int = eqx.field(static=True)
     species_lookup: tuple[int, ...] = eqx.field(static=True)
     pair_lookup: tuple[int, ...] = eqx.field(static=True)
-    num_models: int = eqx.field(static=True)
-    num_active_species: int = eqx.field(static=True)
-    num_active_pairs: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -212,7 +229,6 @@ class ANI2x(eqx.Module):
         self.neighbor_cell_capacity_multiplier = config["neighbor_cell_capacity_multiplier"]
         self.radial_eta = config["radial_eta"]
         self.angular_eta = config["angular_eta"]
-        self.radial_divisions = config["radial_divisions"]
         self.zeta = config["zeta"]
         self.radial_cutoff = config["radial_cutoff"]
         self.angular_cutoff = config["angular_cutoff"]
@@ -220,12 +236,13 @@ class ANI2x(eqx.Module):
         self.radial_shifts = tuple(config["radial_shifts"])
         self.angular_shifts = tuple(config["angular_shifts"])
         self.angular_radial_shifts = tuple(config["angular_radial_shifts"])
-        self.species_to_index = tuple(config["species_to_index"])
-        self.pair_to_index = tuple(tuple(row) for row in config["pair_to_index"])
-        num_species = config["num_species"]
-        num_species_pairs = config["num_species_pairs"]
-        self.num_models = int(config["num_models"])
-        self.angular_basis_width = config["angular_basis_width"]
+        species_order = tuple(int(z) for z in config["species_order"])
+        self.species_to_index = species_index_table(species_order)
+        num_species = len(species_order)
+        self.pair_to_index = pair_index_table(num_species)
+        num_species_pairs = num_species * (num_species + 1) // 2
+        radial_divisions = len(self.radial_shifts)
+        angular_basis_width = len(self.angular_shifts) * len(self.angular_radial_shifts)
 
         if active_species is None:
             active_species = tuple(range(num_species))
@@ -239,20 +256,17 @@ class ANI2x(eqx.Module):
                     f"[0, {num_species}); got {invalid}."
                 )
 
-        active_pairs = _active_pair_ids(active_species, self.pair_to_index)
+        active_pairs = active_pair_ids(active_species, self.pair_to_index)
 
-        self.species_lookup = _lookup_table(active_species, num_species)
-        self.pair_lookup = _lookup_table(active_pairs, num_species_pairs)
-        first_layer_cols = _first_layer_columns(
+        self.species_lookup = lookup_table(active_species, num_species)
+        self.pair_lookup = lookup_table(active_pairs, num_species_pairs)
+        first_layer_cols = first_layer_columns(
             active_species,
             active_pairs,
             num_species=num_species,
-            radial_divisions=self.radial_divisions,
-            angular_basis_width=self.angular_basis_width,
+            radial_divisions=radial_divisions,
+            angular_basis_width=angular_basis_width,
         )
-
-        self.num_active_species = len(active_species)
-        self.num_active_pairs = len(active_pairs)
 
         active_species_idx = jnp.asarray(active_species, dtype=jnp.int32)
         first_layer_cols = jnp.asarray(first_layer_cols, dtype=jnp.int32)
@@ -270,6 +284,15 @@ class ANI2x(eqx.Module):
         self.layer_biases = layer_biases
 
     def species_indices(self, atomic_numbers) -> jnp.ndarray:
+        atomic_numbers_array = np.asarray(jax.device_get(atomic_numbers)).reshape(-1)
+        species_to_index = np.asarray(self.species_to_index, dtype=np.int32)
+        unsupported = sorted(
+            z
+            for z in set(atomic_numbers_array.tolist())
+            if z < 0 or z >= len(species_to_index) or species_to_index[z] < 0
+        )
+        if unsupported:
+            raise ValueError(f"ANI2x does not support atomic numbers {unsupported}.")
         return jnp.asarray(self.species_to_index, dtype=jnp.int32)[
             jnp.asarray(atomic_numbers, dtype=jnp.int32)
         ]
@@ -295,20 +318,24 @@ class ANI2x(eqx.Module):
             self.angular_radial_shifts,
             dtype=positions.dtype,
         )
+        num_active_species = self.atom_energies.shape[0]
+        num_active_pairs = max(self.pair_lookup) + 1
+        radial_divisions = len(self.radial_shifts)
+        angular_basis_width = len(self.angular_shifts) * len(self.angular_radial_shifts)
 
         local_species = species_lookup[species]
 
-        radial_displacements, radial_safe_neighbors, radial_neighbor_mask = dense_neighbor_edges(
+        radial_displacements, radial_safe_neighbor_idx, radial_edge_mask = dense_neighbor_edges(
             positions,
             radial_neighbor_idx,
             box_vectors=box_vectors,
         )
-        local_radial_neighbor_species = local_species[radial_safe_neighbors]
+        local_radial_neighbor_species = local_species[radial_safe_neighbor_idx]
 
         # R_ij is the distance between atom i and radial neighbor j.
         radial_distance2 = jnp.sum(radial_displacements**2, axis=-1)
         radial_distance = jnp.sqrt(jnp.clip(radial_distance2, min=1e-5))
-        radial_real_neighbor = radial_neighbor_mask & (radial_safe_neighbors != atom_ids[:, None])
+        radial_real_neighbor = radial_edge_mask & (radial_safe_neighbor_idx != atom_ids[:, None])
 
         # Eq. 3: radial symmetry terms, then sum them by species.
         radial_mask = radial_real_neighbor & (radial_distance < self.radial_cutoff)
@@ -322,56 +349,56 @@ class ANI2x(eqx.Module):
         radial_terms = jnp.where(radial_active[..., None], radial_terms, 0.0)
         radial_one_hot = jax.nn.one_hot(
             local_radial_neighbor_species,
-            self.num_active_species,
+            num_active_species,
             dtype=radial_terms.dtype,
         )
         radial_aev = jnp.einsum("nkr,nks->nsr", radial_terms, radial_one_hot).reshape(
             num_atoms,
-            self.num_active_species * self.radial_divisions,
+            num_active_species * radial_divisions,
         )
 
-        angular_displacements, angular_safe_neighbors, angular_neighbor_mask = (
-            dense_neighbor_edges(
-                positions,
-                angular_neighbor_idx,
-                box_vectors=box_vectors,
-            )
+        angular_displacements, angular_safe_neighbor_idx, angular_edge_mask = dense_neighbor_edges(
+            positions,
+            angular_neighbor_idx,
+            box_vectors=box_vectors,
         )
-        angular_neighbor_species = species[angular_safe_neighbors]
+        angular_neighbor_species = species[angular_safe_neighbor_idx]
 
         # Eq. 4/5: angular symmetry terms over unique neighbor pairs around atom i.
         angular_distance2 = jnp.sum(angular_displacements**2, axis=-1)
         angular_distance = jnp.sqrt(jnp.clip(angular_distance2, min=1e-5))
-        angular_real_neighbor = angular_neighbor_mask & (
-            angular_safe_neighbors != atom_ids[:, None]
+        angular_real_neighbor = angular_edge_mask & (
+            angular_safe_neighbor_idx != atom_ids[:, None]
         )
         angular_mask = angular_real_neighbor & (angular_distance < self.angular_cutoff)
         angular_switch = piecewise_cutoff(angular_distance, self.angular_cutoff) * angular_mask
-        direction = angular_displacements / jnp.clip(angular_distance[..., None], min=1e-5)
-
         neighbor_i_np, neighbor_j_np = np.triu_indices(int(angular_neighbor_idx.shape[1]), k=1)
         neighbor_i = jnp.asarray(neighbor_i_np, dtype=jnp.int32)
         neighbor_j = jnp.asarray(neighbor_j_np, dtype=jnp.int32)
         pair_mask = angular_mask[:, neighbor_i] & angular_mask[:, neighbor_j]
-        cos_angle = jnp.sum(
-            direction[:, neighbor_i, :] * direction[:, neighbor_j, :],
-            axis=-1,
-        )
+        vector_i = angular_displacements[:, neighbor_i, :]
+        vector_j = angular_displacements[:, neighbor_j, :]
+        dot_product = jnp.sum(vector_i * vector_j, axis=-1)
+        distance_product = angular_distance[:, neighbor_i] * angular_distance[:, neighbor_j]
+        cos_angle = dot_product / jnp.clip(distance_product, min=1.0e-10)
         angle = jnp.arccos(0.95 * cos_angle)
 
-        angular_part = (1 + jnp.cos(angle[..., None] - angular_shifts)) ** self.zeta
-        switch_scale = angular_switch * (2.0 * 0.5**self.zeta) ** 0.5
+        angular_part = ((1.0 + jnp.cos(angle[..., None] - angular_shifts)) / 2.0) ** self.zeta
         angular_part = (
-            angular_part * (switch_scale[:, neighbor_i] * switch_scale[:, neighbor_j])[..., None]
+            2.0
+            * angular_part
+            * (angular_switch[:, neighbor_i] * angular_switch[:, neighbor_j])[..., None]
         )
 
-        scaled_distance = 0.5 * jnp.sqrt(self.angular_eta) * angular_distance
-        pair_distance = (scaled_distance[:, neighbor_i] + scaled_distance[:, neighbor_j])[
-            ..., None
-        ]
-        angular_radial_part = jnp.exp(-((pair_distance - angular_radial_shifts) ** 2))
+        pair_distance = (
+            (angular_distance[:, neighbor_i] + angular_distance[:, neighbor_j]) / 2.0
+        )[..., None]
+        unscaled_radial_shifts = angular_radial_shifts / jnp.sqrt(self.angular_eta)
+        angular_radial_part = jnp.exp(
+            -self.angular_eta * (pair_distance - unscaled_radial_shifts) ** 2
+        )
         angular_terms = (angular_part[..., None, :] * angular_radial_part[..., :, None]).reshape(
-            num_atoms, -1, self.angular_basis_width
+            num_atoms, -1, angular_basis_width
         )
 
         pair_index = pair_to_index[
@@ -383,17 +410,17 @@ class ANI2x(eqx.Module):
         angular_terms = jnp.where((pair_mask & pair_active)[..., None], angular_terms, 0.0)
         pair_one_hot = jax.nn.one_hot(
             active_pair,
-            self.num_active_pairs,
+            num_active_pairs,
             dtype=angular_terms.dtype,
         )
         angular_aev = jnp.einsum("npa,nps->nsa", angular_terms, pair_one_hot).reshape(
             num_atoms,
-            self.num_active_pairs * self.angular_basis_width,
+            num_active_pairs * angular_basis_width,
         )
 
         species_selector = jax.nn.one_hot(
             local_species,
-            self.num_active_species,
+            num_active_species,
             dtype=positions.dtype,
         )
 
@@ -422,6 +449,7 @@ class ANI2x(eqx.Module):
                 x = jax.nn.celu(x, alpha=self.celu_alpha)
 
         mlp_energies = x.squeeze(-1)
+
         atom_energies = jax.lax.stop_gradient(self.atom_energies[local_species])
         return jnp.mean(mlp_energies + atom_energies[:, None], axis=1)
 
@@ -467,48 +495,58 @@ class ANI2x(eqx.Module):
             angular_neighbor_idx=angular_neighbor_idx,
             box_vectors=box_vectors if periodic else None,
         )
-        local_energy = jnp.sum(node_energies)
-        return local_energy
+        return jnp.sum(node_energies)
+
 
 def load_model(
     model: str | PathLike = "ani2x-jax-ensemble",
     *,
+    dtype=jnp.float32,
     atomic_numbers=None,
-    model_path: str | PathLike | None = None,
     neighbor_cell_atom_threshold: int | None = None,
     neighbor_cell_capacity_multiplier: float | None = None,
 ) -> ANI2x:
     """Load an ANI-2x checkpoint, optionally specialized to a fixed atomic-number set."""
+    path = (
+        ANI2X_MODEL_PATHS[model]
+        if isinstance(model, str) and model in ANI2X_MODEL_PATHS
+        else Path(model)
+    )
 
-    if model_path is not None:
-        path = Path(model_path)
-    elif isinstance(model, PathLike):
-        path = Path(model)
-    elif model in ANI2X_MODEL_PATHS:
-        path = ANI2X_MODEL_PATHS[model]
-    else:
-        path = Path(model)
-
-    with path.open("rb") as handle:
-        config = json.loads(handle.readline().decode())
-        config = dict(config)
+    use_float64 = jnp.dtype(dtype) == jnp.dtype(jnp.float64)
+    with jax.enable_x64(use_float64), path.open("rb") as handle:
+        config = json.loads(handle.readline().decode("utf-8"))
         if neighbor_cell_atom_threshold is not None:
             config["neighbor_cell_atom_threshold"] = int(neighbor_cell_atom_threshold)
         if neighbor_cell_capacity_multiplier is not None:
-            config["neighbor_cell_capacity_multiplier"] = float(
-                neighbor_cell_capacity_multiplier
-            )
+            config["neighbor_cell_capacity_multiplier"] = float(neighbor_cell_capacity_multiplier)
         active_species = None
         if atomic_numbers is not None:
-            species = jnp.asarray(config["species_to_index"], dtype=jnp.int32)[
-                jnp.asarray(atomic_numbers, dtype=jnp.int32)
-            ]
-            active_species = tuple(
-                int(x) for x in sorted(set(np.asarray(jax.device_get(species)).tolist()))
-            )
-        # Need to first load the whole model and then prune out weights for other species
-        return ANI2x(
+            species_order = tuple(int(z) for z in config["species_order"])
+            species_to_index = np.asarray(species_index_table(species_order), dtype=np.int32)
+            atomic_numbers = np.asarray(jax.device_get(atomic_numbers), dtype=np.int64).reshape(-1)
+            unsupported = sorted(set(atomic_numbers.tolist()) - set(species_order))
+            if unsupported:
+                raise ValueError(f"ANI2x does not support atomic numbers {unsupported}.")
+            species = species_to_index[atomic_numbers]
+            active_species = tuple(int(x) for x in sorted(set(species.tolist())))
+        # Load the full checkpoint before pruning weights for inactive species.
+        checkpoint_template = ANI2xCheckpoint(
+            config,
+            dtype=jnp.float32,
+            atom_energy_dtype=jnp.float64 if use_float64 else jnp.float32,
+        )
+        loaded_model = ANI2x(
             config=config,
-            checkpoint=eqx.tree_deserialise_leaves(handle, ANI2xCheckpoint(config)),
+            checkpoint=eqx.tree_deserialise_leaves(
+                handle,
+                checkpoint_template,
+            ),
             active_species=active_species,
+        )
+        return jax.tree_util.tree_map(
+            lambda value: value.astype(dtype)
+            if eqx.is_array(value) and jnp.issubdtype(value.dtype, jnp.floating)
+            else value,
+            loaded_model,
         )

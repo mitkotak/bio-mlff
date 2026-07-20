@@ -16,14 +16,13 @@ from jax_md import partition, space
 
 jax.config.update("jax_default_matmul_precision", "highest")
 
-EV_TO_KJMOL = 96.48533212331002
-
 ORB_MODEL_PATHS = {
-    "orb-jax-v3-conservative-omol": Path(__file__).resolve().with_name(
-        "orb-v3-conservative-omol.eqx"
-    ),
+    "orb-jax-v3-conservative-omol": Path(__file__)
+    .resolve()
+    .with_name("orb-v3-conservative-omol.eqx"),
 }
 ORB_MODEL_NAMES = tuple(ORB_MODEL_PATHS)
+
 
 def get_neighbors(
     positions,
@@ -62,7 +61,6 @@ def get_neighbors(
         capacity_multiplier=float(cell_capacity_multiplier),
         disable_cell_list=not use_cell_list,
         mask_self=True,
-        fractional_coordinates=False,
         format=partition.NeighborListFormat.Dense,
     )
     return neighbor_fn.allocate(
@@ -73,18 +71,21 @@ def get_neighbors(
 
 def dense_neighbor_edges(
     positions,
-    neighbors,
+    neighbor_idx,
     *,
     box_vectors=None,
     cutoff: float | None = None,
+    max_num_neighbors: int | None = None,
 ):
     num_atoms = positions.shape[0]
     atom_ids = jnp.arange(num_atoms, dtype=jnp.int32)
-    neighbors = jnp.asarray(neighbors, dtype=jnp.int32)
-    neighbor_mask = (neighbors >= 0) & (neighbors < num_atoms)
-    safe_neighbors = jnp.where(neighbor_mask, neighbors, atom_ids[:, None])
+    neighbor_idx = jnp.asarray(neighbor_idx, dtype=jnp.int32)
+    if max_num_neighbors is not None:
+        neighbor_idx = neighbor_idx[:, : int(max_num_neighbors)]
+    edge_mask = (neighbor_idx >= 0) & (neighbor_idx < num_atoms)
+    safe_neighbor_idx = jnp.where(edge_mask, neighbor_idx, atom_ids[:, None])
 
-    neighbor_positions = positions[safe_neighbors]
+    neighbor_positions = positions[safe_neighbor_idx]
     if box_vectors is None:
         edge_vectors = neighbor_positions - positions[:, None, :]
     else:
@@ -96,17 +97,19 @@ def dense_neighbor_edges(
         edge_vectors = space.map_neighbor(displacement)(positions, neighbor_positions)
 
     distances = jnp.linalg.norm(edge_vectors, axis=-1)
-    edge_mask = neighbor_mask & (safe_neighbors != atom_ids[:, None]) & (distances > 1.0e-8)
+    edge_mask = edge_mask & (safe_neighbor_idx != atom_ids[:, None]) & (distances > 1.0e-8)
     if cutoff is not None:
         edge_mask = edge_mask & (distances < cutoff)
+
     edge_vectors = jnp.where(edge_mask[..., None], edge_vectors, 0.0)
-    senders = jnp.broadcast_to(atom_ids[:, None], safe_neighbors.shape)
+    senders = jnp.broadcast_to(atom_ids[:, None], safe_neighbor_idx.shape)
     return (
         edge_vectors.reshape(-1, 3),
         senders.reshape(-1),
-        safe_neighbors.reshape(-1),
+        safe_neighbor_idx.reshape(-1),
         edge_mask.reshape(-1),
     )
+
 
 def polynomial_cutoff(r: Array, r_max: float | Array, p: float) -> Array:
     ratio = r / r_max
@@ -125,9 +128,7 @@ def bessel_basis(
     prefactor: Array,
 ) -> Array:
     safe_r = jnp.maximum(r, 1.0e-7)
-    return prefactor * (
-        jnp.sin(bessel_weights[None, :] * safe_r[:, None]) / safe_r[:, None]
-    )
+    return prefactor * (jnp.sin(bessel_weights[None, :] * safe_r[:, None]) / safe_r[:, None])
 
 
 def condition_nodes(
@@ -207,15 +208,13 @@ class Linear(eqx.Module):
         config: dict[str, Any],
         prefix: str,
     ) -> None:
-        weight_spec = config["params"][f"{prefix}.weight"]
-        bias_spec = config["params"][f"{prefix}.bias"]
         self.weight = jnp.zeros(
-            tuple(weight_spec["shape"]),
-            dtype=np.dtype(weight_spec["dtype"]),
+            tuple(config["params"][f"{prefix}.weight"]),
+            dtype=np.dtype(config["parameter_dtype"]),
         )
         self.bias = jnp.zeros(
-            tuple(bias_spec["shape"]),
-            dtype=np.dtype(bias_spec["dtype"]),
+            tuple(config["params"][f"{prefix}.bias"]),
+            dtype=np.dtype(config["parameter_dtype"]),
         )
 
     def __call__(self, x: Array) -> Array:
@@ -244,29 +243,28 @@ class MLP(eqx.Module):
 class MLPNorm(eqx.Module):
     mlp: MLP
     norm_weight: Array
-    eps: float = eqx.field(static=True)
 
     def __init__(
         self,
         config: dict[str, Any],
         prefix: str,
     ) -> None:
-        self.eps = float(config.get("rms_norm_eps", 1.1920928955078125e-7))
         self.mlp = MLP(
             config,
             f"{prefix}.mlp",
-            int(config.get("mlp_num_layers", 3)),
+            int(config["mlp_num_layers"]),
         )
-        norm_spec = config["params"][f"{prefix}.layer_norm.weight"]
         self.norm_weight = jnp.zeros(
-            tuple(norm_spec["shape"]),
-            dtype=np.dtype(norm_spec["dtype"]),
+            tuple(config["params"][f"{prefix}.layer_norm.weight"]),
+            dtype=np.dtype(config["parameter_dtype"]),
         )
 
     def __call__(self, x: Array) -> Array:
         x = self.mlp(x)
-        scale = jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + self.eps)
+        eps = jnp.asarray(jnp.finfo(x.dtype).eps, dtype=x.dtype)
+        scale = jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps)
         return x * scale * self.norm_weight
+
 
 class AttentionBlock(eqx.Module):
     cond_node_proj: Linear
@@ -319,8 +317,6 @@ class ORBLayer(eqx.Module):
     encoder_node_fn: MLPNorm
     encoder_edge_fn: MLPNorm
     blocks: tuple[AttentionBlock, ...]
-    num_layers: int = eqx.field(static=True)
-    mlp_num_layers: int = eqx.field(static=True)
     edge_feature_dim: int = eqx.field(static=True)
     cutoff: float = eqx.field(static=True)
     cutoff_polynomial_p: float = eqx.field(static=True)
@@ -331,47 +327,55 @@ class ORBLayer(eqx.Module):
         config: dict[str, Any],
         cutoff: float,
         num_layers: int,
-        mlp_num_layers: int,
         edge_feature_dim: int,
         cutoff_polynomial_p: float,
     ) -> None:
-        self.num_layers = int(num_layers)
-        self.mlp_num_layers = int(mlp_num_layers)
         self.edge_feature_dim = int(edge_feature_dim)
         self.cutoff = float(cutoff)
         self.cutoff_polynomial_p = float(cutoff_polynomial_p)
 
-        spec = config["params"]["model.rbf_transform.bessel_weights"]
         self.rbf_bessel_weights = jnp.zeros(
-            tuple(spec["shape"]),
-            dtype=np.dtype(spec["dtype"]),
+            tuple(config["params"]["model.rbf_transform.bessel_weights"]),
+            dtype=np.dtype(config["parameter_dtype"]),
         )
-        spec = config["params"]["model.rbf_transform.prefactor"]
         self.rbf_prefactor = jnp.zeros(
-            tuple(spec["shape"]),
-            dtype=np.dtype(spec["dtype"]),
+            tuple(config["params"]["model.rbf_transform.prefactor"]),
+            dtype=np.dtype(config["parameter_dtype"]),
         )
-        spec = config["params"]["model.atom_emb.embeddings.weight"]
         self.atom_embedding = jnp.zeros(
-            tuple(spec["shape"]),
-            dtype=np.dtype(spec["dtype"]),
+            tuple(config["params"]["model.atom_emb.embeddings.weight"]),
+            dtype=np.dtype(config["parameter_dtype"]),
         )
-        spec = config["params"]["model.conditioner.charge_embedding.W"]
         self.charge_embedding = jnp.zeros(
-            tuple(spec["shape"]),
-            dtype=np.dtype(spec["dtype"]),
+            tuple(config["params"]["model.conditioner.charge_embedding.W"]),
+            dtype=np.dtype(config["parameter_dtype"]),
         )
-        spec = config["params"]["model.conditioner.spin_embedding.W"]
         self.spin_embedding = jnp.zeros(
-            tuple(spec["shape"]),
-            dtype=np.dtype(spec["dtype"]),
+            tuple(config["params"]["model.conditioner.spin_embedding.W"]),
+            dtype=np.dtype(config["parameter_dtype"]),
         )
         self.encoder_node_fn = MLPNorm(config, "model._encoder._node_fn")
         self.encoder_edge_fn = MLPNorm(config, "model._encoder._edge_fn")
         self.blocks = tuple(
-            AttentionBlock(config, f"model.gnn_stacks.{i}")
-            for i in range(self.num_layers)
+            AttentionBlock(config, f"model.gnn_stacks.{i}") for i in range(num_layers)
         )
+
+    def prepare_static_inputs(
+        self,
+        species: Array,
+        total_charge: Array,
+        total_spin: Array,
+    ) -> tuple[Array, Array]:
+        """Encode position-independent node inputs once for an exported force."""
+        node_features = self.encoder_node_fn(self.atom_embedding[species])
+        conditioning_features = condition_nodes(
+            self.charge_embedding,
+            self.spin_embedding,
+            total_charge,
+            total_spin,
+            species.shape[0],
+        )
+        return node_features, conditioning_features
 
     def __call__(
         self,
@@ -382,6 +386,9 @@ class ORBLayer(eqx.Module):
         edge_mask: Array,
         total_charge: Array,
         total_spin: Array,
+        *,
+        initial_node_features: Array | None = None,
+        conditioning_features: Array | None = None,
     ) -> Array:
         distances = safe_norm(edge_vectors, axis=-1)
         rbfs = bessel_basis(distances, self.rbf_bessel_weights, self.rbf_prefactor)
@@ -395,19 +402,29 @@ class ORBLayer(eqx.Module):
         edges_in = (cutoff[:, :, None] * rbfs[:, :, None] * angular[:, None, :]).reshape(
             (senders.shape[0], self.edge_feature_dim)
         )
-        nodes_in = self.atom_embedding[species]
-        cond_nodes = condition_nodes(
-            self.charge_embedding,
-            self.spin_embedding,
-            total_charge,
-            total_spin,
-            species.shape[0],
-        )
+        if (initial_node_features is None) != (conditioning_features is None):
+            raise ValueError(
+                "initial_node_features and conditioning_features must be provided together"
+            )
+        if initial_node_features is None:
+            initial_node_features, conditioning_features = self.prepare_static_inputs(
+                species,
+                total_charge,
+                total_spin,
+            )
+        assert conditioning_features is not None
 
-        nodes = self.encoder_node_fn(nodes_in)
+        nodes = initial_node_features
         edges = self.encoder_edge_fn(edges_in)
         for block in self.blocks:
-            nodes, edges = block(nodes, edges, cond_nodes, senders, receivers, cutoff)
+            nodes, edges = block(
+                nodes,
+                edges,
+                conditioning_features,
+                senders,
+                receivers,
+                cutoff,
+            )
         return nodes
 
 
@@ -416,7 +433,6 @@ class EnergyHead(eqx.Module):
     energy_normalizer_var: Array
     energy_normalizer_mean: Array
     energy_reference_weight: Array
-    energy_mlp_num_layers: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -424,26 +440,22 @@ class EnergyHead(eqx.Module):
         config: dict[str, Any],
         energy_mlp_num_layers: int,
     ) -> None:
-        self.energy_mlp_num_layers = int(energy_mlp_num_layers)
         self.energy_mlp = MLP(
             config,
             "heads.energy.mlp",
-            self.energy_mlp_num_layers,
+            energy_mlp_num_layers,
         )
-        spec = config["params"]["heads.energy.normalizer.bn.running_var"]
         self.energy_normalizer_var = jnp.zeros(
-            tuple(spec["shape"]),
-            dtype=np.dtype(spec["dtype"]),
+            tuple(config["params"]["heads.energy.normalizer.bn.running_var"]),
+            dtype=np.dtype(config["parameter_dtype"]),
         )
-        spec = config["params"]["heads.energy.normalizer.bn.running_mean"]
         self.energy_normalizer_mean = jnp.zeros(
-            tuple(spec["shape"]),
-            dtype=np.dtype(spec["dtype"]),
+            tuple(config["params"]["heads.energy.normalizer.bn.running_mean"]),
+            dtype=np.dtype(config["parameter_dtype"]),
         )
-        spec = config["params"]["heads.energy.reference.linear.weight"]
         self.energy_reference_weight = jnp.zeros(
-            tuple(spec["shape"]),
-            dtype=np.dtype(spec["dtype"]),
+            tuple(config["params"]["heads.energy.reference.linear.weight"]),
+            dtype=np.dtype(config["parameter_dtype"]),
         )
 
     def __call__(self, node_features: Array, species: Array) -> Array:
@@ -458,27 +470,31 @@ class EnergyHead(eqx.Module):
 
 class ZBLRepulsion(eqx.Module):
     covalent_radii: Array
+    coulomb_ev_angstrom: float = eqx.field(static=True)
     zbl_polynomial_p: float = eqx.field(static=True)
+    zbl_atomic_number_exponent: float = eqx.field(static=True)
     zbl_screening_length_scale: float = eqx.field(static=True)
+    zbl_screening_weights: tuple[float, ...] = eqx.field(static=True)
+    zbl_screening_exponents: tuple[float, ...] = eqx.field(static=True)
 
     def __init__(
         self,
         *,
         config: dict[str, Any],
-        zbl_polynomial_p: float,
-        zbl_screening_length_scale: float,
     ) -> None:
-        self.zbl_polynomial_p = float(zbl_polynomial_p)
-        self.zbl_screening_length_scale = float(zbl_screening_length_scale)
-        spec = config["params"]["covalent_radii"]
+        self.coulomb_ev_angstrom = float(config["zbl_coulomb_ev_angstrom"])
+        self.zbl_polynomial_p = float(config["zbl_polynomial_p"])
+        self.zbl_atomic_number_exponent = float(config["zbl_atomic_number_exponent"])
+        self.zbl_screening_length_scale = float(config["zbl_screening_length_scale"])
+        self.zbl_screening_weights = tuple(float(x) for x in config["zbl_screening_weights"])
+        self.zbl_screening_exponents = tuple(float(x) for x in config["zbl_screening_exponents"])
         self.covalent_radii = jnp.zeros(
-            tuple(spec["shape"]),
-            dtype=np.dtype(spec["dtype"]),
+            tuple(config["params"]["covalent_radii"]),
+            dtype=np.dtype(config["parameter_dtype"]),
         )
 
     def __call__(
         self,
-        positions: Array,
         species: Array,
         edge_vectors: Array,
         senders: Array,
@@ -490,26 +506,28 @@ class ZBLRepulsion(eqx.Module):
         safe_distances = jnp.maximum(distances, 1.0e-7)
         z_sender = species[senders] + 1
         z_receiver = species[receivers] + 1
-        z_sender_f = z_sender.astype(positions.dtype)
-        z_receiver_f = z_receiver.astype(positions.dtype)
-
+        z_sender_f = z_sender.astype(edge_vectors.dtype)
+        z_receiver_f = z_receiver.astype(edge_vectors.dtype)
+        zbl_exponent = jnp.asarray(self.zbl_atomic_number_exponent, dtype=edge_vectors.dtype)
         screening_length = self.zbl_screening_length_scale / (
-            z_sender_f**0.300 + z_receiver_f**0.300
+            z_sender_f**zbl_exponent + z_receiver_f**zbl_exponent
         )
         scaled_distance = safe_distances / screening_length
-        screening_weights = jnp.array(
-            [0.1818, 0.5099, 0.2802, 0.02817],
-            dtype=positions.dtype,
+        screening_weights = jnp.asarray(
+            self.zbl_screening_weights,
+            dtype=edge_vectors.dtype,
         )[:, None]
-        screening_exponents = jnp.array(
-            [3.2, 0.9423, 0.4028, 0.2016],
-            dtype=positions.dtype,
+        screening_exponents = jnp.asarray(
+            self.zbl_screening_exponents,
+            dtype=edge_vectors.dtype,
         )[:, None]
         zbl_screening = jnp.sum(
             screening_weights * jnp.exp(-screening_exponents * scaled_distance[None, :]),
             axis=0,
         )
-        bare_nuclear_repulsion = 14.3996 * z_sender_f * z_receiver_f / safe_distances
+        bare_nuclear_repulsion = (
+            self.coulomb_ev_angstrom * z_sender_f * z_receiver_f / safe_distances
+        )
         cutoff_radius = self.covalent_radii[z_sender] + self.covalent_radii[z_receiver]
         orb_envelope = polynomial_cutoff(
             safe_distances,
@@ -525,67 +543,49 @@ class Orb(eqx.Module):
     layer: ORBLayer
     energy_head: EnergyHead
     zbl_repulsion: ZBLRepulsion
-    name: str = eqx.field(static=True)
     cutoff: float = eqx.field(static=True)
     ev_to_kjmol: float = eqx.field(static=True)
     num_species_embeddings: int = eqx.field(static=True)
+    max_num_neighbors: int = eqx.field(static=True)
     neighbor_cell_atom_threshold: int = eqx.field(static=True)
     neighbor_cell_capacity_multiplier: float = eqx.field(static=True)
-    num_layers: int = eqx.field(static=True)
-    mlp_num_layers: int = eqx.field(static=True)
-    energy_mlp_num_layers: int = eqx.field(static=True)
-    edge_feature_dim: int = eqx.field(static=True)
-    cutoff_polynomial_p: float = eqx.field(static=True)
-    zbl_polynomial_p: float = eqx.field(static=True)
-    zbl_screening_length_scale: float = eqx.field(static=True)
 
     def __init__(
         self,
         *,
         config: dict[str, Any],
     ) -> None:
-        self.name = str(config["name"])
         self.cutoff = float(config["cutoff"])
-        self.ev_to_kjmol = float(config.get("ev_to_kjmol", EV_TO_KJMOL))
-        self.num_species_embeddings = int(
-            config.get(
-                "num_species_embeddings",
-                config["params"]["model.atom_emb.embeddings.weight"]["shape"][0],
-            )
-        )
-        self.neighbor_cell_atom_threshold = int(
-            config.get("neighbor_cell_atom_threshold", 64)
-        )
-        self.neighbor_cell_capacity_multiplier = float(
-            config.get("neighbor_cell_capacity_multiplier", 1.5)
-        )
-        self.num_layers = int(config.get("num_layers", config.get("num_gnn_stacks", 5)))
-        self.mlp_num_layers = int(config.get("mlp_num_layers", 3))
-        self.energy_mlp_num_layers = int(config.get("energy_mlp_num_layers", 2))
-        self.edge_feature_dim = int(config.get("edge_feature_dim", 128))
-        self.cutoff_polynomial_p = float(config.get("cutoff_polynomial_p", 4.0))
-        self.zbl_polynomial_p = float(config.get("zbl_polynomial_p", 6.0))
-        self.zbl_screening_length_scale = float(
-            config.get("zbl_screening_length_scale", 0.4543 * 0.529)
-        )
+        self.ev_to_kjmol = float(config["ev_to_kjmol"])
+        self.num_species_embeddings = int(config["num_species_embeddings"])
+        self.max_num_neighbors = int(config["max_num_neighbors"])
+        self.neighbor_cell_atom_threshold = int(config["neighbor_cell_atom_threshold"])
+        self.neighbor_cell_capacity_multiplier = float(config["neighbor_cell_capacity_multiplier"])
+        num_layers = int(config["num_layers"])
+        energy_mlp_num_layers = int(config["energy_mlp_num_layers"])
+        edge_feature_dim = int(config["edge_feature_dim"])
+        cutoff_polynomial_p = float(config["cutoff_polynomial_p"])
 
         self.layer = ORBLayer(
             config=config,
             cutoff=self.cutoff,
-            num_layers=self.num_layers,
-            mlp_num_layers=self.mlp_num_layers,
-            edge_feature_dim=self.edge_feature_dim,
-            cutoff_polynomial_p=self.cutoff_polynomial_p,
+            num_layers=num_layers,
+            edge_feature_dim=edge_feature_dim,
+            cutoff_polynomial_p=cutoff_polynomial_p,
         )
         self.energy_head = EnergyHead(
             config=config,
-            energy_mlp_num_layers=self.energy_mlp_num_layers,
+            energy_mlp_num_layers=energy_mlp_num_layers,
         )
-        self.zbl_repulsion = ZBLRepulsion(
-            config=config,
-            zbl_polynomial_p=self.zbl_polynomial_p,
-            zbl_screening_length_scale=self.zbl_screening_length_scale,
+        self.zbl_repulsion = ZBLRepulsion(config=config)
+
+    def validate_species(self, species) -> None:
+        species = np.asarray(jax.device_get(species), dtype=np.int64).reshape(-1)
+        unsupported = sorted(
+            z for z in set(species.tolist()) if z < 0 or z >= self.num_species_embeddings
         )
+        if unsupported:
+            raise ValueError(f"ORB does not support atomic numbers {unsupported}.")
 
     def local_node_features(
         self,
@@ -596,12 +596,15 @@ class Orb(eqx.Module):
         *,
         neighbor_idx: Array,
         box_vectors: Array | None = None,
+        initial_node_features: Array | None = None,
+        conditioning_features: Array | None = None,
     ) -> tuple[Array, Array, Array, Array, Array]:
         edge_vectors, senders, receivers, edge_mask = dense_neighbor_edges(
             positions_angstrom,
             neighbor_idx,
             box_vectors=box_vectors,
             cutoff=float(self.cutoff),
+            max_num_neighbors=self.max_num_neighbors,
         )
         node_features = self.layer(
             edge_vectors,
@@ -611,6 +614,8 @@ class Orb(eqx.Module):
             edge_mask,
             total_charge,
             total_spin,
+            initial_node_features=initial_node_features,
+            conditioning_features=conditioning_features,
         )
         return node_features, edge_vectors, senders, receivers, edge_mask
 
@@ -625,6 +630,8 @@ class Orb(eqx.Module):
         neighbors=None,
         neighbor_idx: Array | None = None,
         periodic: bool | None = False,
+        initial_node_features: Array | None = None,
+        conditioning_features: Array | None = None,
     ) -> Array:
         periodic = bool(periodic)
         if neighbor_idx is None:
@@ -646,42 +653,48 @@ class Orb(eqx.Module):
             total_spin,
             neighbor_idx=neighbor_idx,
             box_vectors=box_vectors,
+            initial_node_features=initial_node_features,
+            conditioning_features=conditioning_features,
         )
         graph_energy = self.energy_head(node_features, species)
         zbl_energy = self.zbl_repulsion(
-            positions_angstrom,
             species,
             edge_vectors,
             senders,
             receivers,
             edge_mask,
         )
-        total_energy = graph_energy + zbl_energy
-        return total_energy
+        return graph_energy + zbl_energy
 
 
 def load_model(
     model: str | PathLike = "orb-jax-v3-conservative-omol",
     *,
-    model_path: str | PathLike | None = None,
+    dtype=jnp.float32,
+    atomic_numbers=None,
     neighbor_cell_atom_threshold: int | None = None,
     neighbor_cell_capacity_multiplier: float | None = None,
 ) -> Orb:
-    if model_path is not None:
-        path = Path(model_path)
-    elif isinstance(model, PathLike):
-        path = Path(model)
-    elif model in ORB_MODEL_PATHS:
-        path = ORB_MODEL_PATHS[model]
-    else:
-        path = Path(model)
+    path = (
+        ORB_MODEL_PATHS[model]
+        if isinstance(model, str) and model in ORB_MODEL_PATHS
+        else Path(model)
+    )
 
-    with path.open("rb") as handle:
-        config = dict(json.loads(handle.readline().decode()))
+    with jax.enable_x64(jnp.dtype(dtype) == jnp.dtype(jnp.float64)), path.open("rb") as handle:
+        config = json.loads(handle.readline().decode("utf-8"))
         if neighbor_cell_atom_threshold is not None:
             config["neighbor_cell_atom_threshold"] = int(neighbor_cell_atom_threshold)
         if neighbor_cell_capacity_multiplier is not None:
-            config["neighbor_cell_capacity_multiplier"] = float(
-                neighbor_cell_capacity_multiplier
-            )
-        return eqx.tree_deserialise_leaves(handle, Orb(config=config))
+            config["neighbor_cell_capacity_multiplier"] = float(neighbor_cell_capacity_multiplier)
+        model_template = Orb(config=config)
+        loaded_model = eqx.tree_deserialise_leaves(handle, model_template)
+        loaded_model = jax.tree_util.tree_map(
+            lambda value: value.astype(dtype)
+            if eqx.is_array(value) and jnp.issubdtype(value.dtype, jnp.floating)
+            else value,
+            loaded_model,
+        )
+        if atomic_numbers is not None:
+            loaded_model.validate_species(atomic_numbers)
+        return loaded_model

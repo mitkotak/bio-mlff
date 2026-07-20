@@ -1,27 +1,19 @@
 # /// script
-# dependencies = ["ase", "numpy", "openmm", "orb-models"]
+# dependencies = ["ase", "numpy", "openmm", "orb-models==0.5.5"]
 # ///
-# This script computes reference energies and forces for the ORB conservative OMOL model.
 
 from pathlib import Path
 
 import ase.io
 import numpy as np
-from openmm import unit
 from orb_models.forcefield import pretrained as orb
-
-try:
-    from orb_models.forcefield.inference.calculator import ORBCalculator
-except ModuleNotFoundError:
-    from orb_models.forcefield.calculator import ORBCalculator
+from orb_models.forcefield.calculator import ORBCalculator
+from reference_utils import EV_A_TO_KJMOL_A, EV_TO_KJMOL
 
 DATA_DIR = Path(__file__).resolve().parent
-EV_TO_KJMOL = (unit.elementary_charge * unit.volt * unit.AVOGADRO_CONSTANT_NA).value_in_unit(
-    unit.kilojoules_per_mole
-)
-EV_A_TO_KJMOL_A = (
-    unit.elementary_charge * unit.volt / unit.angstrom * unit.AVOGADRO_CONSTANT_NA
-).value_in_unit(unit.kilojoules_per_mole / unit.angstrom)
+MODEL = "orb-jax-v3-conservative-omol"
+UPSTREAM_MODEL = "orb-v3-conservative-omol"
+OVERRIDE_MODEL = f"{MODEL}/override-charge-spin"
 SYSTEMS = {
     "toluene": DATA_DIR / "toluene" / "toluene.pdb",
     "alanine-dipeptide-explicit": DATA_DIR
@@ -30,68 +22,74 @@ SYSTEMS = {
 }
 
 
-MODEL = "orb-v3-conservative-omol"
-MODEL_PRECISION = "float32-highest"
-
-
-def make_calculator():
-    pretrained = orb.ORB_PRETRAINED_MODELS[MODEL](precision=MODEL_PRECISION)
-    if isinstance(pretrained, tuple):
-        orbff, atoms_adapter = pretrained
-        return ORBCalculator(orbff, atoms_adapter=atoms_adapter, device="cuda")
-    return ORBCalculator(pretrained, device="cuda")
-
-
 def calculate_reference(
-    path: Path,
+    structure_path: Path,
+    calculator: ORBCalculator,
+    *,
     charge: int,
     spin: int,
-    *,
     include_forces: bool = True,
 ) -> dict[str, float | np.ndarray]:
-    atoms = ase.io.read(path)
+    atoms = ase.io.read(structure_path)
     atoms.info["charge"] = charge
     atoms.info["spin"] = spin
-    atoms.calc = make_calculator()
+    calculator.reset()
+    atoms.calc = calculator
     reference: dict[str, float | np.ndarray] = {
-        "energy": atoms.get_potential_energy() * EV_TO_KJMOL,
+        "energy": np.float64(atoms.get_potential_energy() * EV_TO_KJMOL).item(),
     }
     if include_forces:
-        reference["forces"] = atoms.get_forces() * EV_A_TO_KJMOL_A
+        reference["forces"] = np.asarray(
+            atoms.get_forces() * EV_A_TO_KJMOL_A,
+            dtype=np.float64,
+        )
     return reference
 
 
-def calculate_results() -> dict[str, float | np.ndarray]:
-    results = {}
-    reference = calculate_reference(SYSTEMS["toluene"], charge=0, spin=1)
-    results[f"toluene/{MODEL}"] = reference["energy"]
-    results[f"toluene/{MODEL}/forces"] = reference["forces"]
+def main() -> None:
+    model = orb.ORB_PRETRAINED_MODELS[UPSTREAM_MODEL](
+        precision="float64",
+        compile=False,
+        device="cuda",
+    )
+    calculator = ORBCalculator(model, device="cuda")
+    results: dict[str, float | np.ndarray] = {}
+
     reference = calculate_reference(
         SYSTEMS["toluene"],
+        calculator,
+        charge=0,
+        spin=1,
+    )
+    result_key = f"toluene/{MODEL}"
+    results[result_key] = reference["energy"]
+    results[f"{result_key}/forces"] = reference["forces"]
+
+    reference = calculate_reference(
+        SYSTEMS["toluene"],
+        calculator,
         charge=-1,
         spin=3,
         include_forces=False,
     )
-    results[f"toluene/{MODEL}/override-charge-spin"] = reference["energy"]
+    results[f"toluene/{OVERRIDE_MODEL}"] = reference["energy"]
+
     reference = calculate_reference(
         SYSTEMS["alanine-dipeptide-explicit"],
+        calculator,
         charge=0,
         spin=1,
     )
-    results[f"alanine-dipeptide-explicit/{MODEL}"] = reference["energy"]
-    results[f"alanine-dipeptide-explicit/{MODEL}/forces"] = reference["forces"]
-    return results
+    result_key = f"alanine-dipeptide-explicit/{MODEL}"
+    results[result_key] = reference["energy"]
+    results[f"{result_key}/forces"] = reference["forces"]
 
-
-def print_results(results: dict[str, float | np.ndarray]) -> None:
     for key, value in results.items():
         if isinstance(value, np.ndarray):
-            value = np.array2string(value, precision=12, separator=", ", threshold=np.inf)
-        print(f"{key}: {value!r}")
-
-
-def main() -> None:
-    print_results(calculate_results())
+            value = np.array2string(value, precision=17, separator=", ", threshold=np.inf)
+            print(f"{key}: np.array({value}, dtype=np.float64)")
+        else:
+            print(f"{key}: {value!r}")
 
 
 if __name__ == "__main__":

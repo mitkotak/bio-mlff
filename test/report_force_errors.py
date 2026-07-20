@@ -1,12 +1,11 @@
 """Run force-reference tests and report maximum absolute/relative errors."""
 
-import sys
 import inspect
+import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
-
 
 TESTS = [
     "test/TestAIMNet2Potential.py::TestAIMNet2::testCreatePureMLSystem",
@@ -28,7 +27,6 @@ def print_error(reference, calculated):
     calculated = np.asarray(calculated, dtype=float)
     difference = np.abs(reference - calculated)
     relative = difference / np.maximum(np.abs(reference), np.finfo(float).tiny)
-    shape = "x".join(map(str, reference.shape))
     print(f"{test:90} {difference.max():12.6g} {relative.max():12.6g}")
 
 

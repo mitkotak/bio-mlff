@@ -106,7 +106,7 @@ requires-dist = [
     { name = "jaxlib" },
     { name = "numpy" },
     { name = "openmm", specifier = ">=8.5.2" },
-    { name = "openmmjax-cu12", specifier = ">=0.1.3.2" },
+    { name = "openmmjax-cu12", specifier = ">=0.1.4" },
     { name = "openmmml", specifier = ">=1.7" },
     { name = "pytest", marker = "extra == 'test'" },
     { name = "ruff", marker = "extra == 'lint'", specifier = ">=0.12" },

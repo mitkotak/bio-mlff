@@ -5,12 +5,8 @@ import math
 import time
 from pathlib import Path
 
-from openmm import (
-    LangevinMiddleIntegrator,
-    Platform,
-    unit,
-)
-from openmm.app import ForceField, HBonds, NoCutoff, PDBFile, PME, Simulation
+from openmm import LangevinMiddleIntegrator, Platform, unit
+from openmm.app import PME, ForceField, HBonds, NoCutoff, PDBFile, Simulation
 from openmmml.mlpotential import MLPotential
 
 WATER_DIR = Path(__file__).with_name("water")
