@@ -20,7 +20,6 @@ jax.config.update("jax_default_matmul_precision", "highest")
 SO3LR_MODEL_PATHS = {
     "so3lr": Path(__file__).resolve().with_name("so3lr.eqx"),
 }
-SO3LR_MODEL_NAMES = tuple(SO3LR_MODEL_PATHS)
 
 
 def neighbor_displacement(positions, box=None, *, periodic: bool):
@@ -74,20 +73,6 @@ def get_sparse_neighbors(
     )
 
 
-def so3lr_sparse_edges(positions, neighbors, *, displacement):
-    """Convert a JAX-MD sparse neighbor list into SO3LR/GLP edge arrays."""
-    if not partition.is_sparse(neighbors.format):
-        raise ValueError("SO3LR requires a JAX-MD sparse neighbor list.")
-    idx_j, idx_i = jnp.asarray(neighbors.idx, dtype=jnp.int32)
-    num_atoms = positions.shape[0]
-    edge_mask = (idx_i < num_atoms) & (idx_j < num_atoms)
-    safe_idx_i = jnp.where(edge_mask, idx_i, 0)
-    safe_idx_j = jnp.where(edge_mask, idx_j, 0)
-    displacements = jax.vmap(displacement)(positions[safe_idx_j], positions[safe_idx_i])
-    displacements = jnp.where(edge_mask[:, None], displacements, 0.0)
-    return idx_i, idx_j, displacements
-
-
 def get_sparse_edge_data(
     positions,
     box,
@@ -108,11 +93,16 @@ def get_sparse_edge_data(
         neighbors=neighbors,
         periodic=periodic,
     )
-    return so3lr_sparse_edges(
-        positions,
-        neighbors,
-        displacement=displacement,
-    )
+    if not partition.is_sparse(neighbors.format):
+        raise ValueError("SO3LR requires a JAX-MD sparse neighbor list.")
+    idx_j, idx_i = jnp.asarray(neighbors.idx, dtype=jnp.int32)
+    num_atoms = positions.shape[0]
+    edge_mask = (idx_i < num_atoms) & (idx_j < num_atoms)
+    safe_idx_i = jnp.where(edge_mask, idx_i, 0)
+    safe_idx_j = jnp.where(edge_mask, idx_j, 0)
+    displacements = jax.vmap(displacement)(positions[safe_idx_j], positions[safe_idx_i])
+    displacements = jnp.where(edge_mask[:, None], displacements, 0.0)
+    return idx_i, idx_j, displacements
 
 
 def safe_mask(mask, fn, operand, placeholder=0.0):
@@ -1072,7 +1062,7 @@ class SO3LR(eqx.Module):
         box_vectors=None,
         neighbors=None,
         neighbors_lr=None,
-        periodic=False,
+        periodic: bool = False,
         total_charge=0.0,
         total_spin=0.0,
     ):

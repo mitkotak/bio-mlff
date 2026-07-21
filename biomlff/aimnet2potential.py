@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from functools import partial
-from typing import Iterable, Optional
+from collections.abc import Iterable
 
 import jax
 import jax.numpy as jnp
@@ -17,7 +16,7 @@ from openmmjax_export import (
 from openmmml.mlpotential import MLPotential, MLPotentialImpl, MLPotentialImplFactory
 
 from .aimnet2 import (
-    AIMNET2_MODEL_NAMES,
+    AIMNET2_MODEL_PATHS,
     get_neighbors,
     load_model,
 )
@@ -57,14 +56,14 @@ class AIMNet2PotentialImpl(MLPotentialImpl):
         self,
         topology: app.Topology,
         system: openmm.System,
-        atoms: Optional[Iterable[int]],
+        atoms: Iterable[int] | None,
         forceGroup: int,
-        modelPath: Optional[str] = None,
-        total_charge: Optional[float] = None,
-        neighbor_cell_atom_threshold: Optional[int] = None,
-        neighbor_cell_capacity_multiplier: Optional[float] = None,
+        modelPath: str | None = None,
+        total_charge: float | None = None,
+        neighbor_cell_atom_threshold: int | None = None,
+        neighbor_cell_capacity_multiplier: float | None = None,
         periodic_neighborlist: bool = True,
-        multiplicity: Optional[int] = None,
+        multiplicity: int | None = None,
         preprocessing_positions=None,
         preprocessing_positions_unit=unit.nanometer,
         use_float64: bool = False,
@@ -83,7 +82,7 @@ class AIMNet2PotentialImpl(MLPotentialImpl):
             )
             model_ref = modelPath if modelPath is not None else self.modelPath
             if model_ref is None:
-                if self.name in AIMNET2_MODEL_NAMES:
+                if self.name in AIMNET2_MODEL_PATHS:
                     model_ref = self.name
                 else:
                     raise ValueError("modelPath must be provided for custom AIMNet2 models")
@@ -131,46 +130,43 @@ class AIMNet2PotentialImpl(MLPotentialImpl):
                     jnp.asarray(atoms, dtype=jnp.int32)
                 ]
 
-            def allocate_neighbor_lists(box_vectors_angstrom, positions_angstrom):
-                neighbor_list = allocate_neighbor_list(
-                    box_vectors_angstrom,
-                    positions_angstrom,
-                    cell_atom_threshold=int(model.neighbor_cell_atom_threshold),
-                    cutoff=float(model.cutoff),
-                    cell_capacity_multiplier=float(model.neighbor_cell_capacity_multiplier),
-                    periodic=force_periodic,
-                )
-                long_range_neighbor_list = allocate_neighbor_list(
-                    box_vectors_angstrom,
-                    positions_angstrom,
-                    cell_atom_threshold=int(model.neighbor_cell_atom_threshold),
-                    cutoff=float(model.lr_cutoff),
-                    cell_capacity_multiplier=float(model.neighbor_cell_capacity_multiplier),
-                    periodic=force_periodic,
-                )
-                return neighbor_list, long_range_neighbor_list
-
-            neighbor_list, long_range_neighbor_list = allocate_neighbor_lists(
-                allocation_box_vectors_angstrom,
+            neighbor_list = get_neighbors(
                 allocation_positions_angstrom,
+                allocation_box_vectors_angstrom,
+                cell_atom_threshold=int(model.neighbor_cell_atom_threshold),
+                cutoff=model.cutoff,
+                cell_capacity_multiplier=model.neighbor_cell_capacity_multiplier,
+                periodic=force_periodic,
             )
-            d3_data = model.prepare_d3_data(atomic_numbers)
-            energy_fn = partial(
-                energyAIMNet2,
-                model=model,
-                species=species,
-                total_charge=jnp.asarray(
-                    self.total_charge if total_charge is None else total_charge,
-                    dtype=dtype,
-                ),
-                d3_data=d3_data,
-                pbc=force_periodic,
-                neighbor_list=neighbor_list,
-                long_range_neighbor_list=long_range_neighbor_list,
+            long_range_neighbor_list = get_neighbors(
+                allocation_positions_angstrom,
+                allocation_box_vectors_angstrom,
+                cell_atom_threshold=int(model.neighbor_cell_atom_threshold),
+                cutoff=model.lr_cutoff,
+                cell_capacity_multiplier=model.neighbor_cell_capacity_multiplier,
+                periodic=force_periodic,
+            )
+            model_total_charge = jnp.asarray(
+                self.total_charge if total_charge is None else total_charge,
+                dtype=dtype,
             )
 
             def energy_kjmol(positions_nm, box_vectors_nm=None):
-                return energy_fn((positions_nm, box_vectors_nm))
+                angstrom_per_nm = unit.nanometer.conversion_factor_to(unit.angstrom)
+                energy = model(
+                    positions_nm * angstrom_per_nm,
+                    species,
+                    box_vectors=(
+                        box_vectors_nm * angstrom_per_nm
+                        if force_periodic and box_vectors_nm is not None
+                        else None
+                    ),
+                    neighbors=neighbor_list,
+                    lr_neighbors=long_range_neighbor_list,
+                    periodic=force_periodic,
+                    total_charge=model_total_charge,
+                )
+                return (energy * model.ev_to_kjmol).astype(positions_nm.dtype)
 
             def energy_and_forces_kjmol(positions_nm, box_vectors_nm=None):
                 energy, energy_gradient = jax.value_and_grad(energy_kjmol)(
@@ -209,7 +205,7 @@ class AIMNet2PotentialImpl(MLPotentialImpl):
             system.addForce(force)
 
 
-for model_name in AIMNET2_MODEL_NAMES:
+for model_name in AIMNET2_MODEL_PATHS:
     MLPotential.registerImplFactory(model_name, AIMNet2PotentialImplFactory())
 
 __all__ = [
@@ -217,54 +213,3 @@ __all__ = [
     "AIMNet2PotentialImplFactory",
     "MLPotential",
 ]
-
-
-def allocate_neighbor_list(
-    box_vectors_angstrom,
-    positions_angstrom,
-    *,
-    cell_atom_threshold: int,
-    cutoff: float,
-    cell_capacity_multiplier: float,
-    periodic: bool,
-):
-    if periodic and box_vectors_angstrom is None:
-        raise ValueError("periodic neighbor-list allocation requires a box.")
-    return get_neighbors(
-        positions_angstrom,
-        box_vectors_angstrom,
-        cell_atom_threshold=cell_atom_threshold,
-        cutoff=float(cutoff),
-        cell_capacity_multiplier=cell_capacity_multiplier,
-        periodic=periodic,
-    )
-
-
-def energyAIMNet2(
-    state,
-    model,
-    species,
-    total_charge,
-    d3_data,
-    pbc: bool,
-    neighbor_list,
-    long_range_neighbor_list,
-):
-    """Evaluate AIMNet2 energy in kJ/mol from OpenMM positions in nm."""
-    positions_nm, box_vectors_nm = state
-    angstrom_per_nm = unit.nanometer.conversion_factor_to(unit.angstrom)
-    positions_angstrom = positions_nm * angstrom_per_nm
-    box_vectors_angstrom = None
-    if pbc and box_vectors_nm is not None:
-        box_vectors_angstrom = box_vectors_nm * angstrom_per_nm
-    energy = model(
-        positions_angstrom,
-        species,
-        d3_data=d3_data,
-        box_vectors=box_vectors_angstrom,
-        neighbors=neighbor_list,
-        lr_neighbors=long_range_neighbor_list,
-        periodic=pbc,
-        total_charge=total_charge,
-    )
-    return (energy * model.ev_to_kjmol).astype(positions_nm.dtype)

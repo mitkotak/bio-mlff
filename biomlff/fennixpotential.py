@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from functools import partial
-from typing import ClassVar, Iterable, Optional, Sequence
+from collections.abc import Iterable, Sequence
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -48,11 +48,11 @@ class FeNNixPotentialImpl(MLPotentialImpl):
         self,
         topology: app.Topology,
         system: openmm.System,
-        atoms: Optional[Iterable[int]],
+        atoms: Iterable[int] | None,
         forceGroup: int,
-        total_charge: Optional[int] = None,
+        total_charge: int | None = None,
         use_float64: bool = False,
-        energy_terms: Optional[Sequence[str]] = None,
+        energy_terms: Sequence[str] | None = None,
         periodic_neighborlist: bool = True,
         minimum_image: bool = True,
         nblist_skin: float | None = 1.5,
@@ -65,6 +65,7 @@ class FeNNixPotentialImpl(MLPotentialImpl):
         with jax.enable_x64(use_float64):
             import fennol
             import numpy as np
+            from flax.core import freeze, unfreeze
 
             if preprocessing_positions is None:
                 raise ValueError(
@@ -119,14 +120,33 @@ class FeNNixPotentialImpl(MLPotentialImpl):
                 key: np.asarray(value) if isinstance(value, jax.Array) else value
                 for key, value in model_inputs.items()
             }
-            preprocessing_coordinates = initial_preprocessing_coordinates_angstrom(
-                preprocessing_positions,
-                dtype=preprocessing_dtype,
-                indices=atom_indices,
-                system_shape=(num_system_atoms, 3),
-                fallback_shape=(species.size, 3),
-                positions_unit=preprocessing_positions_unit,
-            )
+            if hasattr(preprocessing_positions, "value_in_unit"):
+                preprocessing_coordinates = np.asarray(
+                    preprocessing_positions.value_in_unit(unit.angstrom),
+                    dtype=preprocessing_dtype,
+                )
+            else:
+                preprocessing_coordinates = np.asarray(
+                    preprocessing_positions,
+                    dtype=preprocessing_dtype,
+                )
+                preprocessing_coordinates *= preprocessing_positions_unit.conversion_factor_to(
+                    unit.angstrom
+                )
+            expected_system_shape = (num_system_atoms, 3)
+            if preprocessing_coordinates.shape != expected_system_shape:
+                raise ValueError(
+                    "preprocessing_positions must have shape "
+                    f"{expected_system_shape}, got {preprocessing_coordinates.shape}"
+                )
+            if atom_indices is not None:
+                preprocessing_coordinates = preprocessing_coordinates[atom_indices]
+            expected_model_shape = (species.size, 3)
+            if preprocessing_coordinates.shape != expected_model_shape:
+                raise ValueError(
+                    "selected preprocessing_positions must have shape "
+                    f"{expected_model_shape}, got {preprocessing_coordinates.shape}"
+                )
             preprocessing_inputs = {
                 **static_inputs,
                 "coordinates": preprocessing_coordinates,
@@ -141,12 +161,19 @@ class FeNNixPotentialImpl(MLPotentialImpl):
                 ).reshape(1, 3, 3)
                 preprocessing_inputs["cells"] = cells_angstrom
                 preprocessing_inputs["reciprocal_cells"] = np.linalg.inv(cells_angstrom)
-            preprocessing_state = configured_preprocessing_state(
-                model.preprocessing,
-                nblist_skin=nblist_skin,
-                nblist_mult_size=nblist_mult_size,
-                nblist_add_neigh=nblist_add_neigh,
-            )
+            preprocessing_state = unfreeze(model.preprocessing.init())
+            layer_states = []
+            for layer_state in preprocessing_state["layers_state"]:
+                layer_state = unfreeze(layer_state)
+                if nblist_skin is not None and nblist_skin > 0:
+                    layer_state["nblist_skin"] = float(nblist_skin)
+                if nblist_mult_size is not None:
+                    layer_state["nblist_mult_size"] = float(nblist_mult_size)
+                if nblist_add_neigh is not None:
+                    layer_state["add_neigh"] = int(nblist_add_neigh)
+                layer_states.append(freeze(layer_state))
+            preprocessing_state["layers_state"] = tuple(layer_states)
+            preprocessing_state = freeze(preprocessing_state)
             preprocessing_state, _ = model.preprocessing(
                 preprocessing_state,
                 preprocessing_inputs,
@@ -154,35 +181,38 @@ class FeNNixPotentialImpl(MLPotentialImpl):
 
             coordinate_dtype = jnp.float64 if use_float64 else jnp.float32
 
-            energy_fn = partial(
-                energyFeNNix,
-                model=model,
-                static_inputs=static_inputs,
-                preprocessing_state=preprocessing_state,
-                pbc=force_periodic,
-                energy_scale=energy_scale,
-                coordinate_dtype=coordinate_dtype,
-            )
-            energy_and_forces_fn = partial(
-                energyAndForcesFeNNix,
-                model=model,
-                static_inputs=static_inputs,
-                preprocessing_state=preprocessing_state,
-                pbc=force_periodic,
-                energy_scale=energy_scale,
-                force_scale=force_scale,
-                coordinate_dtype=coordinate_dtype,
-            )
-
             def energy_kjmol(positions_nm, box_vectors_nm=None):
-                return energy_fn((positions_nm, box_vectors_nm))
+                processed_inputs = preprocessFeNNix(
+                    (positions_nm, box_vectors_nm),
+                    model=model,
+                    static_inputs=static_inputs,
+                    preprocessing_state=preprocessing_state,
+                    pbc=force_periodic,
+                    coordinate_dtype=coordinate_dtype,
+                )
+                energy, _ = model._total_energy(model.variables, processed_inputs)
+                return (energy.squeeze() * energy_scale).astype(coordinate_dtype)
 
             def energy_and_forces_kjmol(positions_nm, box_vectors_nm=None):
-                energy, forces = energy_and_forces_fn((positions_nm, box_vectors_nm))
-                return energy, forces
+                processed_inputs = preprocessFeNNix(
+                    (positions_nm, box_vectors_nm),
+                    model=model,
+                    static_inputs=static_inputs,
+                    preprocessing_state=preprocessing_state,
+                    pbc=force_periodic,
+                    coordinate_dtype=coordinate_dtype,
+                )
+                energy, forces, _ = model._energy_and_forces(
+                    model.variables,
+                    processed_inputs,
+                )
+                return (
+                    (energy.squeeze() * energy_scale).astype(coordinate_dtype),
+                    (forces * force_scale).astype(coordinate_dtype),
+                )
 
             def forces_kjmol(positions_nm, box_vectors_nm=None):
-                _, forces = energy_and_forces_fn((positions_nm, box_vectors_nm))
+                _, forces = energy_and_forces_kjmol(positions_nm, box_vectors_nm)
                 return forces
 
             (
@@ -223,63 +253,6 @@ __all__ = [
 ]
 
 
-def initial_preprocessing_coordinates_angstrom(
-    positions,
-    *,
-    dtype,
-    indices,
-    system_shape: tuple[int, int],
-    fallback_shape: tuple[int, int],
-    positions_unit,
-):
-    import numpy as np
-
-    if hasattr(positions, "value_in_unit"):
-        coordinates = np.asarray(positions.value_in_unit(unit.angstrom), dtype=dtype)
-    else:
-        coordinates = np.asarray(positions, dtype=dtype)
-        coordinates *= positions_unit.conversion_factor_to(unit.angstrom)
-
-    if coordinates.shape != system_shape:
-        raise ValueError(
-            f"preprocessing_positions must have shape {system_shape}, got {coordinates.shape}"
-        )
-
-    if indices is not None:
-        coordinates = coordinates[indices]
-
-    if coordinates.shape != fallback_shape:
-        raise ValueError(
-            "selected preprocessing_positions must have shape "
-            f"{fallback_shape}, got {coordinates.shape}"
-        )
-    return coordinates
-
-
-def configured_preprocessing_state(
-    preprocessing,
-    *,
-    nblist_skin: float | None,
-    nblist_mult_size: float | None,
-    nblist_add_neigh: int | None,
-):
-    from flax.core import freeze, unfreeze
-
-    state = unfreeze(preprocessing.init())
-    layer_states = []
-    for layer_state in state["layers_state"]:
-        layer_state = unfreeze(layer_state)
-        if nblist_skin is not None and nblist_skin > 0:
-            layer_state["nblist_skin"] = float(nblist_skin)
-        if nblist_mult_size is not None:
-            layer_state["nblist_mult_size"] = float(nblist_mult_size)
-        if nblist_add_neigh is not None:
-            layer_state["add_neigh"] = int(nblist_add_neigh)
-        layer_states.append(freeze(layer_state))
-    state["layers_state"] = tuple(layer_states)
-    return freeze(state)
-
-
 def preprocessFeNNix(
     state,
     model,
@@ -301,54 +274,6 @@ def preprocessFeNNix(
         preprocessing_inputs["cells"] = cells_angstrom
         preprocessing_inputs["reciprocal_cells"] = inverse_3x3(cells_angstrom)
     return model.preprocessing.process(preprocessing_state, preprocessing_inputs)
-
-
-def energyFeNNix(
-    state,
-    model,
-    static_inputs,
-    preprocessing_state,
-    pbc: bool,
-    energy_scale: float,
-    coordinate_dtype,
-):
-    """Evaluate FeNNix energy in kJ/mol from OpenMM positions in nm."""
-    processed_inputs = preprocessFeNNix(
-        state,
-        model=model,
-        static_inputs=static_inputs,
-        preprocessing_state=preprocessing_state,
-        pbc=pbc,
-        coordinate_dtype=coordinate_dtype,
-    )
-    energy, _ = model._total_energy(model.variables, processed_inputs)
-    return (energy.squeeze() * energy_scale).astype(coordinate_dtype)
-
-
-def energyAndForcesFeNNix(
-    state,
-    model,
-    static_inputs,
-    preprocessing_state,
-    pbc: bool,
-    energy_scale: float,
-    force_scale: float,
-    coordinate_dtype,
-):
-    """Evaluate FeNNix energy and forces in OpenMM units from positions in nm."""
-    processed_inputs = preprocessFeNNix(
-        state,
-        model=model,
-        static_inputs=static_inputs,
-        preprocessing_state=preprocessing_state,
-        pbc=pbc,
-        coordinate_dtype=coordinate_dtype,
-    )
-    energy, forces, _ = model._energy_and_forces(model.variables, processed_inputs)
-    return (
-        (energy.squeeze() * energy_scale).astype(coordinate_dtype),
-        (forces * force_scale).astype(coordinate_dtype),
-    )
 
 
 def inverse_3x3(matrix):

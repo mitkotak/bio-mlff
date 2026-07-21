@@ -21,7 +21,6 @@ jax.config.update("jax_default_matmul_precision", "highest")
 AIMNET2_MODEL_PATHS = {
     "aimnet2-jax": Path(__file__).resolve().with_name("aimnet2.eqx"),
 }
-AIMNET2_MODEL_NAMES = tuple(AIMNET2_MODEL_PATHS)
 
 
 def get_neighbors(
@@ -154,51 +153,6 @@ class Linear(eqx.Module):
         return x @ self.weight.T + self.bias
 
 
-def d3bj_energy_neighbors(
-    positions: Array,
-    d3_pre: dict[str, Array],
-    neighbor_idx: Array,
-    box_vectors: Array | None = None,
-    *,
-    cutoff: float,
-) -> Array:
-    edge_vectors, safe_neighbor_idx, edge_mask = dense_neighbor_edges(
-        positions,
-        neighbor_idx,
-        box_vectors=box_vectors,
-        cutoff=float(cutoff),
-    )
-    distances = safe_norm(edge_vectors, axis=-1)
-    rij = distances / float(d3_pre["bohr_a"])
-    species_indices = d3_pre["species_idx"]
-    sp_i = species_indices[:, None]
-    sp_j = species_indices[safe_neighbor_idx]
-    rcov = d3_pre["rcov"]
-    r2r4 = d3_pre["r2r4"]
-
-    rr = (rcov[sp_i] + rcov[sp_j]) / jnp.maximum(rij, 1.0e-8)
-    damp = 1.0 / (1.0 + jnp.exp(-float(d3_pre["d3_k1"]) * (rr - 1.0)))
-    cn = jnp.sum(jnp.where(edge_mask, damp, 0.0), axis=1)
-
-    atom_ids = jnp.arange(positions.shape[0], dtype=jnp.int32)
-    pair_mask = edge_mask & (atom_ids[:, None] < safe_neighbor_idx)
-    pair_c6ab = d3_pre["c6ab"][sp_i, sp_j]
-    e_pair = d3_pair_energy(
-        pair_c6ab,
-        cn[:, None],
-        cn[safe_neighbor_idx],
-        rij,
-        r2r4[sp_i],
-        r2r4[sp_j],
-        d3_s6=float(d3_pre["d3_s6"]),
-        d3_s8=float(d3_pre["d3_s8"]),
-        d3_a1=float(d3_pre["d3_a1"]),
-        d3_a2=float(d3_pre["d3_a2"]),
-        d3_k3=float(d3_pre["d3_k3"]),
-    )
-    return jnp.sum(jnp.where(pair_mask, e_pair, 0.0)) * float(d3_pre["hartree_ev"])
-
-
 def d3_pair_energy(
     pair_c6ab: Array,
     nci: Array,
@@ -242,21 +196,6 @@ def d3_pair_energy(
     return e6 + e8
 
 
-def radial_symmetry_functions(distance: Array, shifts: Array, eta: Array, cutoff: float) -> Array:
-    cutoff_values = cosine_cutoff(distance, cutoff)
-    return jnp.exp(-eta * (distance[..., None] - shifts) ** 2) * cutoff_values[..., None]
-
-
-def cosine_cutoff(distance: Array, cutoff: float) -> Array:
-    distance = jnp.clip(distance, 1.0e-6, cutoff)
-    return 0.5 * (jnp.cos(distance * jnp.pi / cutoff) + 1.0)
-
-
-def exponential_cutoff(d: Array, rc: float, exp_minus_1: float) -> Array:
-    x = jnp.clip(d / rc, 0.0, 1.0 - 1.0e-6)
-    return jnp.exp(-1.0 / (1.0 - x**2)) / exp_minus_1
-
-
 def short_range_coulomb_dense(
     charges: Array,
     d: Array,
@@ -269,7 +208,8 @@ def short_range_coulomb_dense(
 ) -> Array:
     q_ij = charges[:, None] * charges[safe_neighbor_idx]
     inv_d = 1.0 / jnp.maximum(d, 1.0e-8)
-    fc = exponential_cutoff(d, coulomb_rc, exp_minus_1)
+    scaled_distance = jnp.clip(d / coulomb_rc, 0.0, 1.0 - 1.0e-6)
+    fc = jnp.exp(-1.0 / (1.0 - scaled_distance**2)) / exp_minus_1
     e = coulomb_factor * fc * q_ij * inv_d
     return jnp.sum(jnp.where(edge_mask, e, 0.0))
 
@@ -551,13 +491,13 @@ class EnergyHead(eqx.Module):
         *,
         config: dict[str, Any],
         dtype: Any = jnp.float32,
-        atomic_shift_dtype: Any | None = None,
+        atomic_shift_dtype: Any,
         key: Array,
     ):
         self.energy_mlp = MLP(config["energy_sizes"], dtype=dtype, key=key)
         self.atomic_shifts = jnp.zeros(
             (len(config["implemented_species"]),),
-            dtype=dtype if atomic_shift_dtype is None else atomic_shift_dtype,
+            dtype=atomic_shift_dtype,
         )
 
     def __call__(self, aim_vectors: Array, species: Array) -> Array:
@@ -597,7 +537,7 @@ class AIMNet2(eqx.Module):
         *,
         config: dict[str, Any],
         dtype: Any = jnp.float32,
-        atomic_shift_dtype: Any | None = None,
+        atomic_shift_dtype: Any,
         key: Array = jax.random.PRNGKey(0),
     ):
         keys = jax.random.split(key, 4)
@@ -639,46 +579,43 @@ class AIMNet2(eqx.Module):
         self.d3_rcov = jnp.zeros(tuple(int(v) for v in config["d3_rcov_shape"]), dtype=dtype)
         self.d3_r2r4 = jnp.zeros(tuple(int(v) for v in config["d3_r2r4_shape"]), dtype=dtype)
 
-    def validate_species(self, species) -> None:
-        species = np.asarray(jax.device_get(species), dtype=np.int64).reshape(-1)
-        unsupported = sorted(set(species.tolist()) - set(self.implemented_species))
-        if unsupported:
-            supported = ", ".join(str(z) for z in self.implemented_species)
-            raise ValueError(
-                f"AIMNet2 does not support atomic numbers {unsupported}. "
-                f"Supported atomic numbers: {supported}."
-            )
-
-    def prepare_d3_data(self, atomic_numbers):
-        unique_atomic_numbers = np.unique(atomic_numbers)
-        atomic_number_to_index = np.zeros(
-            int(unique_atomic_numbers.max()) + 1,
-            dtype=np.int32,
+    def dispersion_energy(
+        self,
+        positions: Array,
+        species: Array,
+        neighbor_idx: Array,
+        box_vectors: Array | None,
+    ) -> Array:
+        edge_vectors, safe_neighbor_idx, edge_mask = dense_neighbor_edges(
+            positions,
+            neighbor_idx,
+            box_vectors=box_vectors,
+            cutoff=self.lr_cutoff,
         )
-        for species_index, atomic_number in enumerate(unique_atomic_numbers):
-            atomic_number_to_index[int(atomic_number)] = species_index
-        species_indices = atomic_number_to_index[atomic_numbers]
-        unique_atomic_numbers_array = jnp.asarray(unique_atomic_numbers, dtype=jnp.int32)
-        unique_species = jnp.asarray(self.species_lookup, dtype=jnp.int32)[
-            unique_atomic_numbers_array
-        ]
-        return {
-            "c6ab": self.d3_c6ab[
-                unique_species[:, None],
-                unique_species[None, :],
-            ],
-            "rcov": self.d3_rcov[unique_species],
-            "r2r4": self.d3_r2r4[unique_species],
-            "species_idx": jnp.asarray(species_indices, dtype=jnp.int32),
-            "d3_s6": float(self.d3_s6),
-            "d3_s8": float(self.d3_s8),
-            "d3_a1": float(self.d3_a1),
-            "d3_a2": float(self.d3_a2),
-            "d3_k1": float(self.d3_k1),
-            "d3_k3": float(self.d3_k3),
-            "bohr_a": float(self.bohr_a),
-            "hartree_ev": float(self.hartree_ev),
-        }
+        rij = safe_norm(edge_vectors, axis=-1) / self.bohr_a
+        species_i = species[:, None]
+        species_j = species[safe_neighbor_idx]
+
+        rr = (self.d3_rcov[species_i] + self.d3_rcov[species_j]) / jnp.maximum(rij, 1.0e-8)
+        damp = 1.0 / (1.0 + jnp.exp(-self.d3_k1 * (rr - 1.0)))
+        coordination_numbers = jnp.sum(jnp.where(edge_mask, damp, 0.0), axis=1)
+
+        atom_ids = jnp.arange(positions.shape[0], dtype=jnp.int32)
+        pair_mask = edge_mask & (atom_ids[:, None] < safe_neighbor_idx)
+        pair_energy = d3_pair_energy(
+            self.d3_c6ab[species_i, species_j],
+            coordination_numbers[:, None],
+            coordination_numbers[safe_neighbor_idx],
+            rij,
+            self.d3_r2r4[species_i],
+            self.d3_r2r4[species_j],
+            d3_s6=self.d3_s6,
+            d3_s8=self.d3_s8,
+            d3_a1=self.d3_a1,
+            d3_a2=self.d3_a2,
+            d3_k3=self.d3_k3,
+        )
+        return jnp.sum(jnp.where(pair_mask, pair_energy, 0.0)) * self.hartree_ev
 
     def coulomb_energy(
         self,
@@ -729,8 +666,6 @@ class AIMNet2(eqx.Module):
     ) -> tuple[Array, Array, Array, Array, Array]:
         """Return local node energies plus intermediates needed by global terms."""
 
-        atomic_numbers = jnp.asarray(species, dtype=jnp.int32)
-        species = jnp.asarray(self.species_lookup, dtype=jnp.int32)[atomic_numbers]
         edge_vectors, safe_neighbor_idx, edge_mask = dense_neighbor_edges(
             positions,
             neighbor_idx,
@@ -739,11 +674,11 @@ class AIMNet2(eqx.Module):
         )
         r_ij = safe_norm(edge_vectors, axis=-1)
         unit_vectors = edge_vectors / jnp.maximum(r_ij[..., None], 1.0e-8)
-        g_ijs = radial_symmetry_functions(
-            r_ij,
-            self.layer.shifts,
-            self.layer.eta,
-            self.cutoff,
+        cutoff_distances = jnp.clip(r_ij, 1.0e-6, self.cutoff)
+        cutoff_values = 0.5 * (jnp.cos(cutoff_distances * jnp.pi / self.cutoff) + 1.0)
+        g_ijs = (
+            jnp.exp(-self.layer.eta * (r_ij[..., None] - self.layer.shifts) ** 2)
+            * cutoff_values[..., None]
         )
         g_ijs = jnp.where(edge_mask[..., None], g_ijs, 0.0)
         aim_vectors, partial_charges = self.layer(
@@ -763,16 +698,14 @@ class AIMNet2(eqx.Module):
         positions: Array,
         species: Array,
         *,
-        d3_data: dict[str, Array],
         box_vectors: Array | None = None,
         neighbors=None,
         neighbor_idx: Array | None = None,
         lr_neighbors=None,
         lr_neighbor_idx: Array | None = None,
-        periodic: bool | None = False,
+        periodic: bool = False,
         total_charge: Array | float = 0.0,
     ) -> Array:
-        periodic = bool(periodic)
         if neighbor_idx is None:
             neighbors = get_neighbors(
                 positions,
@@ -797,6 +730,9 @@ class AIMNet2(eqx.Module):
             lr_neighbor_idx = lr_neighbors.idx
 
         box_vectors = box_vectors if periodic else None
+        species = jnp.asarray(self.species_lookup, dtype=jnp.int32)[
+            jnp.asarray(species, dtype=jnp.int32)
+        ]
         (
             node_energies,
             partial_charges,
@@ -820,12 +756,11 @@ class AIMNet2(eqx.Module):
             lr_neighbor_idx,
             box_vectors,
         )
-        dispersion_energy = d3bj_energy_neighbors(
+        dispersion_energy = self.dispersion_energy(
             positions,
-            d3_data,
+            species,
             lr_neighbor_idx,
-            box_vectors=box_vectors,
-            cutoff=float(self.lr_cutoff),
+            box_vectors,
         )
         return local_energy + coulomb_energy + dispersion_energy
 
@@ -863,5 +798,14 @@ def load_model(
             loaded_model,
         )
         if atomic_numbers is not None:
-            loaded_model.validate_species(atomic_numbers)
+            atomic_numbers = np.asarray(jax.device_get(atomic_numbers), dtype=np.int64).reshape(-1)
+            unsupported = sorted(
+                set(atomic_numbers.tolist()) - set(loaded_model.implemented_species)
+            )
+            if unsupported:
+                supported = ", ".join(str(z) for z in loaded_model.implemented_species)
+                raise ValueError(
+                    f"AIMNet2 does not support atomic numbers {unsupported}. "
+                    f"Supported atomic numbers: {supported}."
+                )
         return loaded_model

@@ -18,7 +18,6 @@ ACEFF_MODEL_PATHS = {
     "aceff-jax-1.1": Path(__file__).resolve().with_name("aceff_v1.1.eqx"),
     "aceff-jax-2.0": Path(__file__).resolve().with_name("aceff_v2.0.eqx"),
 }
-ACEFF_MODEL_NAMES = tuple(ACEFF_MODEL_PATHS)
 
 
 def get_neighbors(
@@ -69,10 +68,7 @@ def get_neighbors(
 def dense_neighbor_edges(positions, neighbor_idx, *, box_vectors=None, include_self=False):
     num_atoms = positions.shape[0]
     atom_ids = jnp.arange(num_atoms, dtype=jnp.int32)
-    neighbor_idx = jnp.asarray(
-        neighbor_idx.idx if hasattr(neighbor_idx, "idx") else neighbor_idx,
-        dtype=jnp.int32,
-    )
+    neighbor_idx = jnp.asarray(neighbor_idx, dtype=jnp.int32)
     edge_mask = (neighbor_idx >= 0) & (neighbor_idx < num_atoms)
     edge_mask = edge_mask & (neighbor_idx != atom_ids[:, None])
     safe_neighbor_idx = jnp.where(edge_mask, neighbor_idx, atom_ids[:, None])
@@ -96,14 +92,6 @@ def dense_neighbor_edges(positions, neighbor_idx, *, box_vectors=None, include_s
 
     edge_vectors = jnp.where(edge_mask[..., None], edge_vectors, 0.0)
     return edge_vectors, safe_neighbor_idx, edge_mask
-
-
-def unique_pairs(num_atoms: int):
-    pair_src, pair_dst = np.triu_indices(int(num_atoms), k=1)
-    return (
-        jnp.asarray(pair_src, dtype=jnp.int32),
-        jnp.asarray(pair_dst, dtype=jnp.int32),
-    )
 
 
 def cosine_cutoff(d, cutoff, cutoff_lower=0.0):
@@ -159,13 +147,6 @@ def skewtensor_to_vector(A):
         ],
         axis=1,
     )
-
-
-def outer_to_symtensor(T):
-    """Symmetrize and remove trace. [N, 3, 3, F] -> [N, 3, 3, F]."""
-    symmetric = 0.5 * (T + jnp.swapaxes(T, 1, 2))
-    scalar = jnp.diagonal(T, axis1=1, axis2=2).mean(axis=-1)
-    return symmetric - scalar[:, None, None, :] * jnp.eye(3, dtype=scalar.dtype)[None, :, :, None]
 
 
 def tensor_matmul_o3(Y, msg):
@@ -278,7 +259,13 @@ class TensorEmbedding(eqx.Module):
         )
 
         antisymmetric = vector_to_skewtensor(antisymmetric_vectors)
-        symmetric = outer_to_symtensor(symmetric)
+        symmetric = 0.5 * (symmetric + jnp.swapaxes(symmetric, 1, 2))
+        symmetric_trace = jnp.diagonal(symmetric, axis1=1, axis2=2).mean(axis=-1)
+        symmetric = (
+            symmetric
+            - symmetric_trace[:, None, None, :]
+            * jnp.eye(3, dtype=symmetric.dtype)[None, :, :, None]
+        )
         identity = jnp.eye(3, dtype=scalar.dtype)[None, :, :, None]
         tensor_features = scalar[:, None, None, :] * identity + antisymmetric + symmetric
 
@@ -305,17 +292,6 @@ class ChargePredictionHead(eqx.Module):
     def __init__(self, weights):
         self.weights = weights
 
-    def neural_charge_equilibration(
-        self,
-        partial_charges,
-        charge_weights,
-        total_charge=0.0,
-    ):
-        weights = charge_weights**2
-        weight_sum = jnp.sum(weights, axis=0, keepdims=True) + 1.0e-6
-        predicted_charge = jnp.sum(partial_charges, axis=0, keepdims=True)
-        return partial_charges + (weights / weight_sum) * (total_charge - predicted_charge)
-
     def __call__(self, tensor_features, total_charge=0.0):
         weights = self.weights
         scalar, antisymmetric, symmetric = decompose_tensor(tensor_features)
@@ -336,12 +312,10 @@ class ChargePredictionHead(eqx.Module):
 
         ncharge = charge_features.shape[-1] // 2
         partial_charges = charge_features[:, :ncharge]
-        charge_weights = charge_features[:, ncharge:]
-        return self.neural_charge_equilibration(
-            partial_charges,
-            charge_weights,
-            total_charge,
-        )
+        charge_weights = charge_features[:, ncharge:] ** 2
+        weight_sum = jnp.sum(charge_weights, axis=0, keepdims=True) + 1.0e-6
+        predicted_charge = jnp.sum(partial_charges, axis=0, keepdims=True)
+        return partial_charges + (charge_weights / weight_sum) * (total_charge - predicted_charge)
 
 
 class AceFFLayer(eqx.Module):
@@ -547,7 +521,9 @@ class CoulombHead(eqx.Module):
         partial_charges = jnp.concatenate(partial_charges, axis=-1)
         pair_mask = None
         if neighbor_idx is None:
-            pair_src, pair_dst = unique_pairs(int(positions.shape[0]))
+            pair_src, pair_dst = np.triu_indices(int(positions.shape[0]), k=1)
+            pair_src = jnp.asarray(pair_src, dtype=jnp.int32)
+            pair_dst = jnp.asarray(pair_dst, dtype=jnp.int32)
             if box_vectors is None:
                 pair_vectors = positions[pair_src] - positions[pair_dst]
             else:
@@ -766,10 +742,9 @@ class AceFF(eqx.Module):
         neighbor_idx=None,
         coulomb_neighbors=None,
         coulomb_neighbor_idx=None,
-        periodic=False,
+        periodic: bool = False,
         total_charge=0.0,
     ):
-        periodic = bool(periodic)
         if neighbor_idx is None:
             neighbors = get_neighbors(
                 positions,
@@ -837,8 +812,7 @@ def load_model(
             config["neighbor_cell_atom_threshold"] = int(neighbor_cell_atom_threshold)
         if neighbor_cell_capacity_multiplier is not None:
             config["neighbor_cell_capacity_multiplier"] = float(neighbor_cell_capacity_multiplier)
-        checkpoint_weights = pickle.load(handle)
-        loaded_model = AceFF(checkpoint_weights, config)
+        loaded_model = AceFF(pickle.load(handle), config)
         return jax.tree_util.tree_map(
             lambda value: value.astype(dtype)
             if eqx.is_array(value) and jnp.issubdtype(value.dtype, jnp.floating)

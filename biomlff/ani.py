@@ -14,13 +14,10 @@ from jax_md import partition, space
 
 jax.config.update("jax_default_matmul_precision", "highest")
 
-DEFAULT_ENSEMBLE_MODEL_PATH = Path(__file__).resolve().with_name("ani2x_ensemble.eqx")
-DEFAULT_SINGLE_MODEL_PATH = Path(__file__).resolve().with_name("ani2x_model0.eqx")
 ANI2X_MODEL_PATHS = {
-    "ani2x-jax-ensemble": DEFAULT_ENSEMBLE_MODEL_PATH,
-    "ani2x-jax-model0": DEFAULT_SINGLE_MODEL_PATH,
+    "ani2x-jax-ensemble": Path(__file__).resolve().with_name("ani2x_ensemble.eqx"),
+    "ani2x-jax-model0": Path(__file__).resolve().with_name("ani2x_model0.eqx"),
 }
-ANI2X_MODEL_NAMES = tuple(ANI2X_MODEL_PATHS)
 
 
 def dense_neighbor_edges(
@@ -108,38 +105,24 @@ class ANI2xCheckpoint(eqx.Module):
         self,
         config: dict,
         *,
-        dtype: Any = jnp.float32,
-        atom_energy_dtype: Any | None = None,
+        atom_energy_dtype: Any,
     ):
         num_species = len(config["species_order"])
         num_models = config["num_models"]
         network_sizes = tuple(config["network_sizes"])
 
-        self.atom_energies = jnp.zeros(
-            num_species,
-            dtype=dtype if atom_energy_dtype is None else atom_energy_dtype,
-        )
+        self.atom_energies = jnp.zeros(num_species, dtype=atom_energy_dtype)
         self.layer_weights = []
         self.layer_biases = []
         for layer_index in range(len(network_sizes) - 1):
             d_in = network_sizes[layer_index]
             d_out = network_sizes[layer_index + 1]
             self.layer_weights.append(
-                jnp.zeros((num_models, num_species, d_in, d_out), dtype=dtype)
+                jnp.zeros((num_models, num_species, d_in, d_out), dtype=jnp.float32)
             )
-            self.layer_biases.append(jnp.zeros((num_models, num_species, d_out), dtype=dtype))
-
-
-def active_pair_ids(
-    active_species: tuple[int, ...],
-    pair_to_index: tuple[tuple[int, ...], ...],
-) -> tuple[int, ...]:
-    active_species_np = np.asarray(active_species, dtype=np.int32)
-    pair_to_index_np = np.asarray(pair_to_index, dtype=np.int32)
-    return tuple(
-        int(pair_id)
-        for pair_id in np.unique(pair_to_index_np[np.ix_(active_species_np, active_species_np)])
-    )
+            self.layer_biases.append(
+                jnp.zeros((num_models, num_species, d_out), dtype=jnp.float32)
+            )
 
 
 def lookup_table(active_ids: tuple[int, ...], full_size: int) -> tuple[int, ...]:
@@ -165,35 +148,6 @@ def species_index_table(species_order: tuple[int, ...]) -> tuple[int, ...]:
     for species_index, atomic_number in enumerate(species_order):
         table[atomic_number] = species_index
     return tuple(table)
-
-
-def basis_block_columns(
-    active_ids: tuple[int, ...],
-    block_width: int,
-    *,
-    offset: int = 0,
-) -> np.ndarray:
-    active_ids_np = np.asarray(active_ids, dtype=np.int32)
-    block_offsets = active_ids_np[:, None] * block_width
-    block_columns = np.arange(block_width, dtype=np.int32)
-    return (offset + block_offsets + block_columns).reshape(-1)
-
-
-def first_layer_columns(
-    active_species: tuple[int, ...],
-    active_pairs: tuple[int, ...],
-    *,
-    num_species: int,
-    radial_divisions: int,
-    angular_basis_width: int,
-) -> np.ndarray:
-    radial_cols = basis_block_columns(active_species, radial_divisions)
-    angular_cols = basis_block_columns(
-        active_pairs,
-        angular_basis_width,
-        offset=num_species * radial_divisions,
-    )
-    return np.concatenate((radial_cols, angular_cols))
 
 
 class ANI2x(eqx.Module):
@@ -256,20 +210,33 @@ class ANI2x(eqx.Module):
                     f"[0, {num_species}); got {invalid}."
                 )
 
-        active_pairs = active_pair_ids(active_species, self.pair_to_index)
+        active_species_np = np.asarray(active_species, dtype=np.int32)
+        pair_to_index_np = np.asarray(self.pair_to_index, dtype=np.int32)
+        active_pairs = tuple(
+            int(pair_id)
+            for pair_id in np.unique(
+                pair_to_index_np[np.ix_(active_species_np, active_species_np)]
+            )
+        )
 
         self.species_lookup = lookup_table(active_species, num_species)
         self.pair_lookup = lookup_table(active_pairs, num_species_pairs)
-        first_layer_cols = first_layer_columns(
-            active_species,
-            active_pairs,
-            num_species=num_species,
-            radial_divisions=radial_divisions,
-            angular_basis_width=angular_basis_width,
+        radial_cols = (
+            active_species_np[:, None] * radial_divisions
+            + np.arange(radial_divisions, dtype=np.int32)
+        ).reshape(-1)
+        active_pairs_np = np.asarray(active_pairs, dtype=np.int32)
+        angular_cols = (
+            num_species * radial_divisions
+            + active_pairs_np[:, None] * angular_basis_width
+            + np.arange(angular_basis_width, dtype=np.int32)
+        ).reshape(-1)
+        first_layer_cols = jnp.asarray(
+            np.concatenate((radial_cols, angular_cols)),
+            dtype=jnp.int32,
         )
 
-        active_species_idx = jnp.asarray(active_species, dtype=jnp.int32)
-        first_layer_cols = jnp.asarray(first_layer_cols, dtype=jnp.int32)
+        active_species_idx = jnp.asarray(active_species_np)
         self.atom_energies = checkpoint.atom_energies[active_species_idx]
         layer_weights = []
         layer_biases = []
@@ -282,20 +249,6 @@ class ANI2x(eqx.Module):
             layer_biases.append(checkpoint_biases[:, active_species_idx])
         self.layer_weights = layer_weights
         self.layer_biases = layer_biases
-
-    def species_indices(self, atomic_numbers) -> jnp.ndarray:
-        atomic_numbers_array = np.asarray(jax.device_get(atomic_numbers)).reshape(-1)
-        species_to_index = np.asarray(self.species_to_index, dtype=np.int32)
-        unsupported = sorted(
-            z
-            for z in set(atomic_numbers_array.tolist())
-            if z < 0 or z >= len(species_to_index) or species_to_index[z] < 0
-        )
-        if unsupported:
-            raise ValueError(f"ANI2x does not support atomic numbers {unsupported}.")
-        return jnp.asarray(self.species_to_index, dtype=jnp.int32)[
-            jnp.asarray(atomic_numbers, dtype=jnp.int32)
-        ]
 
     def local_node_energies(
         self,
@@ -463,9 +416,8 @@ class ANI2x(eqx.Module):
         angular_neighbors=None,
         radial_neighbor_idx=None,
         angular_neighbor_idx=None,
-        periodic: bool | None = False,
+        periodic: bool = False,
     ):
-        periodic = bool(periodic)
         if radial_neighbor_idx is None:
             radial_neighbors = get_neighbors(
                 positions,
@@ -533,7 +485,6 @@ def load_model(
         # Load the full checkpoint before pruning weights for inactive species.
         checkpoint_template = ANI2xCheckpoint(
             config,
-            dtype=jnp.float32,
             atom_energy_dtype=jnp.float64 if use_float64 else jnp.float32,
         )
         loaded_model = ANI2x(

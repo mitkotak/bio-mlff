@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from functools import partial
-from typing import Iterable, Optional
+from collections.abc import Iterable
 
 import jax
 import jax.numpy as jnp
@@ -16,7 +15,7 @@ from openmmjax_export import (
 from openmmml.mlpotential import MLPotential, MLPotentialImpl, MLPotentialImplFactory
 
 from .aceff import (
-    ACEFF_MODEL_NAMES,
+    ACEFF_MODEL_PATHS,
     get_neighbors,
     load_model,
 )
@@ -41,12 +40,12 @@ class AceFFPotentialImpl(MLPotentialImpl):
         self,
         topology: app.Topology,
         system: openmm.System,
-        atoms: Optional[Iterable[int]],
+        atoms: Iterable[int] | None,
         forceGroup: int,
-        modelPath: Optional[str] = None,
-        total_charge: Optional[float] = None,
-        neighbor_cell_atom_threshold: Optional[int] = None,
-        neighbor_cell_capacity_multiplier: Optional[float] = None,
+        modelPath: str | None = None,
+        total_charge: float | None = None,
+        neighbor_cell_atom_threshold: int | None = None,
+        neighbor_cell_capacity_multiplier: float | None = None,
         periodic_neighborlist: bool = True,
         preprocessing_positions=None,
         preprocessing_positions_unit=unit.nanometer,
@@ -60,7 +59,7 @@ class AceFFPotentialImpl(MLPotentialImpl):
                 included_atoms = [included_atoms[i] for i in atoms]
             model_ref = modelPath if modelPath is not None else self.modelPath
             if model_ref is None:
-                if self.name in ACEFF_MODEL_NAMES:
+                if self.name in ACEFF_MODEL_PATHS:
                     model_ref = self.name
                 else:
                     raise ValueError("modelPath must be provided for custom AceFF models")
@@ -110,43 +109,46 @@ class AceFFPotentialImpl(MLPotentialImpl):
                     jnp.asarray(atoms, dtype=jnp.int32)
                 ]
 
-            def allocate_model_neighbor_list(box_vectors_angstrom, positions_angstrom, cutoff):
-                return allocate_neighbor_list(
-                    box_vectors_angstrom,
-                    positions_angstrom,
+            def allocate_model_neighbor_list(cutoff):
+                return get_neighbors(
+                    allocation_positions_angstrom,
+                    allocation_box_vectors_angstrom,
                     cell_atom_threshold=int(model.neighbor_cell_atom_threshold),
                     cutoff=float(cutoff),
                     cell_capacity_multiplier=float(model.neighbor_cell_capacity_multiplier),
                     periodic=force_periodic,
                 )
 
-            neighbor_list = allocate_model_neighbor_list(
-                allocation_box_vectors_angstrom,
-                allocation_positions_angstrom,
-                model.cutoff,
-            )
+            neighbor_list = allocate_model_neighbor_list(model.cutoff)
             coulomb_neighbor_list = None
             if model.coulomb_head is not None and model.coulomb_head.coulomb_cutoff is not None:
                 coulomb_neighbor_list = allocate_model_neighbor_list(
-                    allocation_box_vectors_angstrom,
-                    allocation_positions_angstrom,
-                    model.coulomb_head.coulomb_cutoff,
+                    model.coulomb_head.coulomb_cutoff
                 )
-            energy_fn = partial(
-                energyAceFF,
-                model=model,
-                species=species,
-                total_charge=jnp.asarray(
-                    self.total_charge if total_charge is None else total_charge,
-                    dtype=dtype,
-                ),
-                pbc=force_periodic,
-                neighbor_list=neighbor_list,
-                coulomb_neighbor_list=coulomb_neighbor_list,
+            model_total_charge = jnp.asarray(
+                self.total_charge if total_charge is None else total_charge,
+                dtype=dtype,
             )
 
             def energy_kjmol(positions_nm, box_vectors_nm=None):
-                return energy_fn((positions_nm, box_vectors_nm))
+                positions_angstrom = positions_nm * unit.nanometer.conversion_factor_to(
+                    unit.angstrom
+                )
+                box_vectors_angstrom = None
+                if force_periodic and box_vectors_nm is not None:
+                    box_vectors_angstrom = box_vectors_nm * unit.nanometer.conversion_factor_to(
+                        unit.angstrom
+                    )
+                energy = model(
+                    positions_angstrom,
+                    species,
+                    box_vectors=box_vectors_angstrom,
+                    neighbors=neighbor_list,
+                    coulomb_neighbors=coulomb_neighbor_list,
+                    periodic=force_periodic,
+                    total_charge=model_total_charge,
+                )
+                return (energy * model.ev_to_kjmol).astype(positions_nm.dtype)
 
             def energy_and_forces_kjmol(positions_nm, box_vectors_nm=None):
                 energy, energy_gradient = jax.value_and_grad(energy_kjmol)(
@@ -185,7 +187,7 @@ class AceFFPotentialImpl(MLPotentialImpl):
             system.addForce(force)
 
 
-for model_name in ACEFF_MODEL_NAMES:
+for model_name in ACEFF_MODEL_PATHS:
     MLPotential.registerImplFactory(model_name, AceFFPotentialImplFactory())
 
 __all__ = [
@@ -193,51 +195,3 @@ __all__ = [
     "AceFFPotentialImplFactory",
     "MLPotential",
 ]
-
-
-def allocate_neighbor_list(
-    box_vectors_angstrom,
-    positions_angstrom,
-    *,
-    cell_atom_threshold: int,
-    cutoff: float,
-    cell_capacity_multiplier: float,
-    periodic: bool,
-):
-    if periodic and box_vectors_angstrom is None:
-        raise ValueError("periodic neighbor-list allocation requires a box.")
-    return get_neighbors(
-        positions_angstrom,
-        box_vectors_angstrom,
-        cutoff=float(cutoff),
-        cell_atom_threshold=cell_atom_threshold,
-        cell_capacity_multiplier=cell_capacity_multiplier,
-        periodic=periodic,
-    )
-
-
-def energyAceFF(
-    state,
-    model,
-    species,
-    total_charge,
-    pbc: bool,
-    neighbor_list,
-    coulomb_neighbor_list,
-):
-    """Evaluate AceFF energy in kJ/mol from OpenMM positions in nm."""
-    positions_nm, box_vectors_nm = state
-    positions_angstrom = positions_nm * unit.nanometer.conversion_factor_to(unit.angstrom)
-    box_vectors_angstrom = None
-    if pbc and box_vectors_nm is not None:
-        box_vectors_angstrom = box_vectors_nm * unit.nanometer.conversion_factor_to(unit.angstrom)
-    energy = model(
-        positions_angstrom,
-        species,
-        box_vectors=box_vectors_angstrom,
-        neighbors=neighbor_list,
-        coulomb_neighbors=coulomb_neighbor_list,
-        periodic=pbc,
-        total_charge=total_charge,
-    )
-    return (energy * model.ev_to_kjmol).astype(positions_nm.dtype)

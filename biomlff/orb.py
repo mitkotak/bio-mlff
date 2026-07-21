@@ -21,7 +21,6 @@ ORB_MODEL_PATHS = {
     .resolve()
     .with_name("orb-v3-conservative-omol.eqx"),
 }
-ORB_MODEL_NAMES = tuple(ORB_MODEL_PATHS)
 
 
 def get_neighbors(
@@ -579,26 +578,32 @@ class Orb(eqx.Module):
         )
         self.zbl_repulsion = ZBLRepulsion(config=config)
 
-    def validate_species(self, species) -> None:
-        species = np.asarray(jax.device_get(species), dtype=np.int64).reshape(-1)
-        unsupported = sorted(
-            z for z in set(species.tolist()) if z < 0 or z >= self.num_species_embeddings
-        )
-        if unsupported:
-            raise ValueError(f"ORB does not support atomic numbers {unsupported}.")
-
-    def local_node_features(
+    def __call__(
         self,
         positions_angstrom: Array,
         species: Array,
         total_charge: Array,
         total_spin: Array,
         *,
-        neighbor_idx: Array,
         box_vectors: Array | None = None,
+        neighbors=None,
+        neighbor_idx: Array | None = None,
+        periodic: bool = False,
         initial_node_features: Array | None = None,
         conditioning_features: Array | None = None,
-    ) -> tuple[Array, Array, Array, Array, Array]:
+    ) -> Array:
+        if neighbor_idx is None:
+            neighbors = get_neighbors(
+                positions_angstrom,
+                box_vectors if periodic else None,
+                cutoff=float(self.cutoff),
+                cell_atom_threshold=int(self.neighbor_cell_atom_threshold),
+                cell_capacity_multiplier=float(self.neighbor_cell_capacity_multiplier),
+                neighbors=neighbors,
+                periodic=periodic,
+            )
+            neighbor_idx = neighbors.idx
+        box_vectors = box_vectors if periodic else None
         edge_vectors, senders, receivers, edge_mask = dense_neighbor_edges(
             positions_angstrom,
             neighbor_idx,
@@ -614,45 +619,6 @@ class Orb(eqx.Module):
             edge_mask,
             total_charge,
             total_spin,
-            initial_node_features=initial_node_features,
-            conditioning_features=conditioning_features,
-        )
-        return node_features, edge_vectors, senders, receivers, edge_mask
-
-    def __call__(
-        self,
-        positions_angstrom: Array,
-        species: Array,
-        total_charge: Array,
-        total_spin: Array,
-        *,
-        box_vectors: Array | None = None,
-        neighbors=None,
-        neighbor_idx: Array | None = None,
-        periodic: bool | None = False,
-        initial_node_features: Array | None = None,
-        conditioning_features: Array | None = None,
-    ) -> Array:
-        periodic = bool(periodic)
-        if neighbor_idx is None:
-            neighbors = get_neighbors(
-                positions_angstrom,
-                box_vectors if periodic else None,
-                cutoff=float(self.cutoff),
-                cell_atom_threshold=int(self.neighbor_cell_atom_threshold),
-                cell_capacity_multiplier=float(self.neighbor_cell_capacity_multiplier),
-                neighbors=neighbors,
-                periodic=periodic,
-            )
-            neighbor_idx = neighbors.idx
-        box_vectors = box_vectors if periodic else None
-        node_features, edge_vectors, senders, receivers, edge_mask = self.local_node_features(
-            positions_angstrom,
-            species,
-            total_charge,
-            total_spin,
-            neighbor_idx=neighbor_idx,
-            box_vectors=box_vectors,
             initial_node_features=initial_node_features,
             conditioning_features=conditioning_features,
         )
@@ -696,5 +662,12 @@ def load_model(
             loaded_model,
         )
         if atomic_numbers is not None:
-            loaded_model.validate_species(atomic_numbers)
+            species = np.asarray(jax.device_get(atomic_numbers), dtype=np.int64).reshape(-1)
+            unsupported = sorted(
+                z
+                for z in set(species.tolist())
+                if z < 0 or z >= loaded_model.num_species_embeddings
+            )
+            if unsupported:
+                raise ValueError(f"ORB does not support atomic numbers {unsupported}.")
         return loaded_model
