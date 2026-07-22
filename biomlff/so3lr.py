@@ -662,9 +662,6 @@ class ZBLRepulsion(eqx.Module):
         idx_j: Array,
         d_ij: Array,
     ) -> Array:
-        # Upstream keeps the published checkpoint leaves in float32, so these
-        # parameter-only transforms remain float32 even for float64 inference.
-        # Preserve that checkpoint semantic before combining with coordinates.
         parameter_dtype = jnp.float32
         a1 = jax.nn.softplus(self.a1.astype(parameter_dtype))
         a2 = jax.nn.softplus(self.a2.astype(parameter_dtype))

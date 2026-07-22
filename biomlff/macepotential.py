@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from functools import partial
-from typing import Iterable, Optional
+from collections.abc import Iterable
 
 import jax
 import jax.numpy as jnp
@@ -15,14 +14,7 @@ from openmmjax_export import (
 )
 from openmmml.mlpotential import MLPotential, MLPotentialImpl, MLPotentialImplFactory
 
-from .mace import (
-    HARTREE_TO_KJMOL,
-    MACE_MODEL_NAMES,
-    get_neighbors,
-    load_model,
-)
-
-jax.config.update("jax_default_matmul_precision", "highest")
+from .mace import MACE_MODEL_PATHS, get_latent_ewald_grid, get_neighbors, load_model
 
 
 class MACEPotentialImplFactory(MLPotentialImplFactory):
@@ -39,165 +31,157 @@ class MACEPotentialImpl(MLPotentialImpl):
         self,
         topology: app.Topology,
         system: openmm.System,
-        atoms: Optional[Iterable[int]],
+        atoms: Iterable[int] | None,
         forceGroup: int,
-        modelPath: Optional[str] = None,
-        neighbor_cell_atom_threshold: Optional[int] = None,
-        neighbor_cell_capacity_multiplier: Optional[float] = None,
+        modelPath: str | None = None,
+        neighbor_cell_atom_threshold: int | None = None,
+        neighbor_cell_capacity_multiplier: float | None = None,
         periodic_neighborlist: bool = True,
+        periodic_box_scale: float = 1.25,
         preprocessing_positions=None,
         preprocessing_positions_unit=unit.nanometer,
+        use_float64: bool = False,
         **args,
     ):
-        includedAtoms = list(topology.atoms())
-        if atoms is not None:
-            atoms = list(atoms)
-            includedAtoms = [includedAtoms[i] for i in atoms]
-        species = jnp.array(
-            [atom.element.atomic_number for atom in includedAtoms],
-            dtype=jnp.int32,
-        )
-        numModelAtoms = len(includedAtoms)
+        with jax.enable_x64(use_float64):
+            included_atoms = list(topology.atoms())
+            if atoms is not None:
+                atoms = list(atoms)
+                included_atoms = [included_atoms[i] for i in atoms]
+            species = jnp.asarray(
+                [atom.element.atomic_number for atom in included_atoms],
+                dtype=jnp.int32,
+            )
+            num_model_atoms = len(included_atoms)
 
-        periodic = (
-            topology.getPeriodicBoxVectors() is not None or system.usesPeriodicBoundaryConditions()
-        )
-        forcePeriodic = periodic and periodic_neighborlist
-        model_ref = modelPath if modelPath is not None else self.modelPath
-        if model_ref is None:
-            if self.name in MACE_MODEL_NAMES:
-                model_ref = self.name
+            force_periodic = periodic_neighborlist and (
+                topology.getPeriodicBoxVectors() is not None
+                or system.usesPeriodicBoundaryConditions()
+            )
+            model_ref = modelPath if modelPath is not None else self.modelPath
+            if model_ref is None:
+                if self.name in MACE_MODEL_PATHS:
+                    model_ref = self.name
+                else:
+                    raise ValueError("modelPath must be provided for custom MACE models")
+            dtype = jnp.float64 if use_float64 else jnp.float32
+            model = load_model(
+                model_ref,
+                dtype=dtype,
+                atomic_numbers=species,
+                neighbor_cell_atom_threshold=neighbor_cell_atom_threshold,
+                neighbor_cell_capacity_multiplier=neighbor_cell_capacity_multiplier,
+            )
+
+            allocation_box_vectors_angstrom = None
+            if force_periodic:
+                box_vectors = topology.getPeriodicBoxVectors()
+                if box_vectors is None:
+                    box_vectors = system.getDefaultPeriodicBoxVectors()
+                allocation_box_vectors_angstrom = jnp.asarray(
+                    [vector.value_in_unit(unit.angstrom) for vector in box_vectors],
+                    dtype=dtype,
+                )
+            if preprocessing_positions is None:
+                raise ValueError("MACE JAX requires preprocessing_positions.")
+            if hasattr(preprocessing_positions, "value_in_unit"):
+                allocation_positions_angstrom = preprocessing_positions.value_in_unit(
+                    unit.angstrom
+                )
             else:
-                raise ValueError("modelPath must be provided for custom MACE models")
-        model = load_model(
-            model_ref,
-            neighbor_cell_atom_threshold=neighbor_cell_atom_threshold,
-            neighbor_cell_capacity_multiplier=neighbor_cell_capacity_multiplier,
-        )
-        neighbor_cell_atom_threshold = int(model.neighbor_cell_atom_threshold)
-
-        allocation_box = None
-        if forcePeriodic:
-            box_vectors = topology.getPeriodicBoxVectors()
-            if box_vectors is None:
-                box_vectors = system.getDefaultPeriodicBoxVectors()
-            allocation_box = jnp.asarray(
-                [vector.value_in_unit(unit.angstrom) for vector in box_vectors],
-                dtype=jnp.float32,
+                allocation_positions_angstrom = jnp.asarray(
+                    preprocessing_positions, dtype=dtype
+                ) * preprocessing_positions_unit.conversion_factor_to(unit.angstrom)
+            allocation_positions_angstrom = jnp.asarray(
+                allocation_positions_angstrom,
+                dtype=dtype,
             )
-        if preprocessing_positions is None:
-            raise ValueError("MACE JAX requires preprocessing_positions.")
-        if hasattr(preprocessing_positions, "value_in_unit"):
-            allocation_positions = preprocessing_positions.value_in_unit(unit.angstrom)
-        else:
-            scale = preprocessing_positions_unit.conversion_factor_to(unit.angstrom)
-            allocation_positions = jnp.asarray(preprocessing_positions, dtype=jnp.float32) * scale
-        allocation_positions = jnp.asarray(allocation_positions, dtype=jnp.float32)
-        if atoms is not None:
-            allocation_positions = allocation_positions[jnp.asarray(atoms, dtype=jnp.int32)]
+            if atoms is not None:
+                allocation_positions_angstrom = allocation_positions_angstrom[
+                    jnp.asarray(atoms, dtype=jnp.int32)
+                ]
 
-        def _allocate_neighbor_list(box_vectors_angstrom, positions_angstrom):
-            return allocate_neighbor_list(
-                box_vectors_angstrom,
-                positions_angstrom,
-                cell_atom_threshold=neighbor_cell_atom_threshold,
+            neighbor_list = get_neighbors(
+                allocation_positions_angstrom,
+                allocation_box_vectors_angstrom,
                 cutoff=float(model.cutoff),
+                cell_atom_threshold=int(model.neighbor_cell_atom_threshold),
                 cell_capacity_multiplier=float(model.neighbor_cell_capacity_multiplier),
-                periodic=forcePeriodic,
+                periodic=force_periodic,
             )
+            long_range_grid = None
+            if force_periodic and model.long_range is not None:
+                long_range_grid = get_latent_ewald_grid(
+                    allocation_box_vectors_angstrom,
+                    dl=model.long_range.dl,
+                    box_scale=periodic_box_scale,
+                    dtype=dtype,
+                )
 
-        neighbor_list = _allocate_neighbor_list(allocation_box, allocation_positions)
-        energy_fn = partial(
-            _energyMACE,
-            model=model,
-            species=species,
-            pbc=forcePeriodic,
-            neighbor_list=neighbor_list,
-        )
+            def energy_kjmol(positions_nm, box_vectors_nm=None):
+                positions_angstrom = positions_nm * unit.nanometer.conversion_factor_to(
+                    unit.angstrom
+                )
+                box_vectors_angstrom = None
+                if force_periodic and box_vectors_nm is not None:
+                    box_vectors_angstrom = box_vectors_nm * unit.nanometer.conversion_factor_to(
+                        unit.angstrom
+                    )
+                energy = model(
+                    positions_angstrom,
+                    species,
+                    box_vectors=box_vectors_angstrom,
+                    neighbors=neighbor_list,
+                    long_range_grid=long_range_grid,
+                    periodic=force_periodic,
+                )
+                energy_to_kjmol = (unit.hartree * unit.AVOGADRO_CONSTANT_NA).value_in_unit(
+                    unit.kilojoules_per_mole
+                )
+                return (energy * energy_to_kjmol).astype(positions_nm.dtype)
 
-        def _energy_kjmol(positions_nm, box_vectors_nm=None):
-            return energy_fn((positions_nm, box_vectors_nm))
+            def energy_and_forces_kjmol(positions_nm, box_vectors_nm=None):
+                energy, energy_gradient = jax.value_and_grad(energy_kjmol)(
+                    positions_nm,
+                    box_vectors_nm,
+                )
+                return energy, -energy_gradient
 
-        def _energy_and_forces_kjmol(positions_nm, box_vectors_nm=None):
-            energy, minus_forces = jax.value_and_grad(_energy_kjmol)(
-                positions_nm,
-                box_vectors_nm,
+            def forces_kjmol(positions_nm, box_vectors_nm=None):
+                return -jax.grad(energy_kjmol)(positions_nm, box_vectors_nm)
+
+            (
+                force_mlir,
+                energy_mlir,
+                energy_and_forces_mlir,
+                compile_options_base64,
+            ) = export_jax_model(
+                num_model_atoms=num_model_atoms,
+                force_function=forces_kjmol,
+                energy_function=energy_kjmol,
+                energy_and_forces_function=energy_and_forces_kjmol,
+                periodic=force_periodic,
+                input_dtype=dtype,
             )
-            return energy, -minus_forces
-
-        def _forces_kjmol(positions_nm, box_vectors_nm=None):
-            return -jax.grad(_energy_kjmol)(positions_nm, box_vectors_nm)
-
-        force_mlir, energy_mlir, energy_and_forces_mlir, compile_options_base64 = export_jax_model(
-            num_model_atoms=numModelAtoms,
-            force_function=_forces_kjmol,
-            energy_function=_energy_kjmol,
-            energy_and_forces_function=_energy_and_forces_kjmol,
-            periodic=forcePeriodic,
-        )
-        force = openmmjax.JaxForce(
-            force_mlir,
-            energy_mlir,
-            energy_and_forces_mlir,
-            compile_options_base64,
-        )
-        configure_pjrt_plugin(force)
-        force.setForceGroup(forceGroup)
-        force.setUsesPeriodicBoundaryConditions(forcePeriodic)
-        if atoms is not None:
-            force.setParticles(atoms)
-        system.addForce(force)
+            force = openmmjax.JaxForce(
+                force_mlir,
+                energy_mlir,
+                energy_and_forces_mlir,
+                compile_options_base64,
+            )
+            configure_pjrt_plugin(force)
+            force.setForceGroup(forceGroup)
+            force.setUsesPeriodicBoundaryConditions(force_periodic)
+            if atoms is not None:
+                force.setParticles(atoms)
+            system.addForce(force)
 
 
-for model_name in MACE_MODEL_NAMES:
+for model_name in MACE_MODEL_PATHS:
     MLPotential.registerImplFactory(model_name, MACEPotentialImplFactory())
 
 __all__ = [
-    "MLPotential",
-    "MACEPotentialImplFactory",
     "MACEPotentialImpl",
+    "MACEPotentialImplFactory",
+    "MLPotential",
 ]
-
-
-def allocate_neighbor_list(
-    box_vectors_angstrom,
-    positions_angstrom,
-    *,
-    cell_atom_threshold: int,
-    cutoff: float,
-    cell_capacity_multiplier: float,
-    periodic: bool,
-):
-    if periodic and box_vectors_angstrom is None:
-        raise ValueError("periodic neighbor-list allocation requires a box.")
-    return get_neighbors(
-        positions_angstrom,
-        box_vectors_angstrom,
-        cutoff=float(cutoff),
-        cell_atom_threshold=cell_atom_threshold,
-        cell_capacity_multiplier=cell_capacity_multiplier,
-        periodic=periodic,
-    )
-
-
-def _energyMACE(
-    state,
-    model,
-    species,
-    pbc: bool,
-    neighbor_list,
-):
-    """Evaluate MACE energy in kJ/mol from OpenMM positions in nm."""
-    positions_nm, box_vectors_nm = state
-    positions = positions_nm * unit.nanometer.conversion_factor_to(unit.angstrom)
-    box_vectors = None
-    if pbc and box_vectors_nm is not None:
-        box_vectors = box_vectors_nm * unit.nanometer.conversion_factor_to(unit.angstrom)
-    energy = model(
-        positions,
-        species,
-        box_vectors=box_vectors,
-        neighbors=neighbor_list,
-        periodic=pbc,
-    )
-    return energy * HARTREE_TO_KJMOL

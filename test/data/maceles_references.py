@@ -7,7 +7,7 @@
 #   "openmm",
 # ]
 # ///
-# Generate MACELES-OFF references directly from upstream in CUDA float64.
+# Generate MACELES-OFF references directly from upstream in CUDA float32.
 
 import tempfile
 import urllib.request
@@ -62,7 +62,7 @@ def main() -> None:
     calculator = MACECalculator(
         model_paths=checkpoint,
         device="cuda",
-        default_dtype="float64",
+        default_dtype="float32",
     )
 
     results: dict[str, dict[str, float | np.ndarray]] = {}
