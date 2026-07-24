@@ -110,12 +110,6 @@ TRICLINIC_FORCES = np.array(
     dtype=np.float64,
 )
 
-# The compact JAX basis and upstream PyTorch basis accumulate float32 operations
-# in different orders.  These measured bounds cover at most three energy ULPs
-# and a 2.72e-3 kJ/mol/angstrom force delta without hiding model-scale errors.
-ENERGY_ATOL = 0.2
-FORCE_ATOL = 0.003
-
 
 class TestMACELES:
     def testFloat32Only(self):
@@ -161,8 +155,8 @@ class TestMACELES:
         forces = state.getForces(asNumpy=True).value_in_unit(
             unit.kilojoules_per_mole / unit.angstrom
         )
-        np.testing.assert_allclose(energy, ENERGY, rtol=1e-10, atol=ENERGY_ATOL)
-        np.testing.assert_allclose(forces, FORCES, rtol=1e-10, atol=FORCE_ATOL)
+        np.testing.assert_allclose(energy, ENERGY, rtol=1e-10)
+        np.testing.assert_allclose(forces, FORCES, rtol=1e-10)
 
     def testCreateMixedSystem(self, assert_mixed_system_interpolation):
         prmtop = app.AmberPrmtopFile(
@@ -215,9 +209,7 @@ class TestMACELES:
         assert_mixed_system_interpolation(
             mm_context,
             mixed_context,
-            interp_context,
-            energy_atol=1e-4,
-            force_atol=1e-3,
+            interp_context
         )
 
     def testPeriodicTriclinicAndExpandedBox(self):
@@ -304,11 +296,9 @@ class TestMACELES:
             energy,
             TRICLINIC_ENERGY,
             rtol=1e-10,
-            atol=ENERGY_ATOL,
         )
         np.testing.assert_allclose(
             forces,
             TRICLINIC_FORCES,
             rtol=1e-10,
-            atol=FORCE_ATOL,
         )

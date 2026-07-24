@@ -73,7 +73,6 @@ FORCES = {
 
 test_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 ani_model_names = ("ani2x-jax-model0", "ani2x-jax-ensemble")
-PURE_FORCE_ATOL = 3e-6
 
 @pytest.mark.parametrize("model", ani_model_names)
 class TestANIPotential:
@@ -87,12 +86,7 @@ class TestANIPotential:
         energy = state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
         forces = state.getForces(asNumpy=True).value_in_unit(unit.kilojoules_per_mole / unit.angstrom)
         np.testing.assert_allclose(ENERGIES["toluene"][model], energy, rtol=1e-10)
-        np.testing.assert_allclose(
-            FORCES["toluene"][model],
-            forces,
-            rtol=1e-10,
-            atol=PURE_FORCE_ATOL,
-        )
+        np.testing.assert_allclose(FORCES["toluene"][model], forces, rtol=1e-10)
 
     def testSimulate(self, model):
         pdb = app.PDBFile(os.path.join(test_data_dir, "toluene", "toluene.pdb"))

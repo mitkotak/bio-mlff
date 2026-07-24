@@ -4619,12 +4619,7 @@ FORCES = {
 }
 
 test_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-# Keep this file scoped to MACE-OFF.  MACE-LES has additional long-range
-# fixtures in TestMACELESPotential.py.
 models = [name for name, path in MACE_OFF_MODEL_PATHS.items() if path.is_file()]
-# Maximum measured PyTorch-CUDA versus JAX/XLA float64 force delta is
-# 2.95e-11 kJ/mol/angstrom for the periodic fixture.
-FORCE_ATOL = 5e-11
 
 
 class TestMACE:
@@ -4662,7 +4657,7 @@ class TestMACE:
         refEnergy = ENERGIES["toluene"]
         refForces = FORCES["toluene"]
         np.testing.assert_allclose(refEnergy[model], energyML, rtol=1e-10)
-        np.testing.assert_allclose(refForces[model], forcesML, rtol=1e-10, atol=FORCE_ATOL)
+        np.testing.assert_allclose(refForces[model], forcesML, rtol=1e-10)
 
     def testPeriodicSystem(self):
         model = "mace-jax-off-s-23"
@@ -4680,7 +4675,7 @@ class TestMACE:
             energyML = state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
             forcesML = state.getForces(asNumpy=True).value_in_unit(unit.kilojoules_per_mole / unit.angstrom)
             assert np.isclose(energyRef, energyML, rtol=1e-10)
-            np.testing.assert_allclose(forcesRef, forcesML, rtol=1e-10, atol=FORCE_ATOL)
+            np.testing.assert_allclose(forcesRef, forcesML, rtol=1e-10)
 
     @pytest.mark.parametrize("model", models)
     def testCreateMixedSystem(self, model, assert_mixed_system_interpolation):

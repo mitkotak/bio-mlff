@@ -4588,7 +4588,6 @@ pytestmark = [
     pytest.mark.skipif(cuda_platform is None, reason="CUDA platform is not available"),
     pytest.mark.skipif(not SO3LR_MODEL_PATHS[model].is_file(), reason=f"{model} checkpoint is not available"),
 ]
-PERIODIC_FORCE_ATOL = 5e-11
 
 
 class TestSO3LR:
@@ -4623,7 +4622,6 @@ class TestSO3LR:
                 forces_ref,
                 forces,
                 rtol=1e-10,
-                atol=PERIODIC_FORCE_ATOL,
             )
 
     def testCreateMixedSystem(self, assert_mixed_system_interpolation):
